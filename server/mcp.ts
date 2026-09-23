@@ -26,6 +26,10 @@ function assertBridge(config: McpBridgeConfig) {
   if (!config.key || config.key.length < 8) throw new Error("A valid OMEGA hub key is required.");
 }
 
+export function isCommandTool(name: string) {
+  return name.toLowerCase() === "termux_exec";
+}
+
 function isReadOnlyTool(name: string) {
   const lower = name.toLowerCase();
   if (["termux_exec", "shell", "exec", "run_command", "inbox_post", "write_file", "delete_file", "deploy", "routeros_command"].includes(lower)) return false;
@@ -33,7 +37,7 @@ function isReadOnlyTool(name: string) {
 }
 
 export function filterAssistantTools(tools: McpTool[]) {
-  return tools.filter(tool => isReadOnlyTool(tool.name));
+  return tools.filter(tool => isReadOnlyTool(tool.name) || isCommandTool(tool.name));
 }
 
 function toModelTools(tools: McpTool[]) {
@@ -41,7 +45,9 @@ function toModelTools(tools: McpTool[]) {
     type: "function" as const,
     function: {
       name: tool.name,
-      description: `${tool.description || "Read-only OMEGA MCP tool"} Read-only assistant access; no command execution or writes.`,
+      description: isCommandTool(tool.name)
+        ? `${tool.description || "Execute a Termux command"} Requires explicit operator confirmation before execution.`
+        : `${tool.description || "Read-only OMEGA MCP tool"} Read-only assistant access; no writes.`,
       parameters: tool.inputSchema || { type: "object", properties: {}, additionalProperties: false },
     },
   }));
@@ -87,9 +93,12 @@ export async function discoverAssistantTools(config: McpBridgeConfig) {
   return { tools: filterAssistantTools(tools), session: listed.session };
 }
 
-export async function callAssistantTool(config: McpBridgeConfig, session: string | null, name: string, args: Record<string, unknown>) {
-  if (!isReadOnlyTool(name)) {
-    return { session, text: `Tool ${name} is blocked for assistant automation because it may execute commands or mutate state. Use the visible Terminal/Tools approval flow instead.` };
+export async function callAssistantTool(config: McpBridgeConfig, session: string | null, name: string, args: Record<string, unknown>, options: { allowCommandExecution?: boolean } = {}) {
+  if (isCommandTool(name) && !options.allowCommandExecution) {
+    return { session, text: `Command approval is required before executing: ${String(args.command || "(empty command)")}` };
+  }
+  if (!isReadOnlyTool(name) && !isCommandTool(name)) {
+    return { session, text: `Tool ${name} is blocked for assistant automation because it may mutate state. Use the visible Terminal/Tools approval flow instead.` };
   }
   const result = await mcpRequest(config, "tools/call", { name, arguments: args }, session);
   return { session: result.session, text: extractMcpText(result.payload) };

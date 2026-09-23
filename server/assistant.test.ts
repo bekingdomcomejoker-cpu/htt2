@@ -46,6 +46,18 @@ describe("OMEGA assistant", () => {
     expect(String((fetch as ReturnType<typeof vi.fn>).mock.calls[4]?.[0])).toContain("/mcp");
   });
 
+  it("pauses before a model-proposed Termux command and returns the exact approval payload", async () => {
+    const responses = [
+      new Response(JSON.stringify({ result: {} }), { status: 200, headers: { "content-type": "application/json", "mcp-session-id": "session-approval" } }),
+      new Response(JSON.stringify({ result: {} }), { status: 200, headers: { "content-type": "application/json" } }),
+      new Response(JSON.stringify({ result: { tools: [{ name: "termux_exec", description: "Execute a command", inputSchema: { type: "object", properties: { command: { type: "string" } } } }] } }), { status: 200, headers: { "content-type": "application/json" } }),
+      new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: null, tool_calls: [{ id: "call-ls", type: "function", function: { name: "termux_exec", arguments: JSON.stringify({ command: "ls -la" }) } }] }, finish_reason: "tool_calls" }], model: "claude-sonnet-4-6" }), { status: 200, headers: { "content-type": "application/json" } }),
+    ];
+    vi.stubGlobal("fetch", vi.fn(async () => responses.shift()!));
+    await expect(completeOmegaAssistant({ prompt: "Please list the files", bridge })).resolves.toMatchObject({ content: expect.stringContaining("ls -la"), pendingTool: { name: "termux_exec", arguments: { command: "ls -la" } } });
+    expect(fetch).toHaveBeenCalledTimes(4);
+  });
+
   it("rejects empty prompts before calling Forge", async () => {
     await expect(completeOmegaAssistant({ prompt: "   " })).rejects.toThrow("A user prompt is required.");
     expect(fetch).not.toHaveBeenCalled();

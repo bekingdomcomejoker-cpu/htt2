@@ -1,6 +1,6 @@
 import { ENV } from "./_core/env";
 import type { InvokeResult, Message } from "./_core/llm";
-import { callAssistantTool, discoverAssistantTools, modelToolsForMcp, type McpBridgeConfig } from "./mcp";
+import { callAssistantTool, discoverAssistantTools, isCommandTool, modelToolsForMcp, type McpBridgeConfig } from "./mcp";
 
 export const MAX_PROMPT_CHARS = 120000;
 const MAX_CONTEXT_MESSAGES = 80;
@@ -8,7 +8,7 @@ const MAX_OUTPUT_TOKENS = 8000;
 const MAX_MCP_ROUNDS = 6;
 const DEFAULT_MODEL = "claude-sonnet-4-6" as const;
 const SYSTEM_PROMPT =
-  "You are the OMEGA cloud assistant. Be precise, practical, and honest about what you can or cannot execute. You may use the provided read-only OMEGA MCP tools to inspect mesh, Termux, and connected service state. Never claim to have accessed an external system unless a tool result actually provided that information. Command execution, writes, deletes, deployments, and network mutations are blocked from this assistant lane.";
+    "You are the OMEGA cloud assistant. Be precise, practical, and honest about what you can or cannot execute. You may inspect mesh, Termux, and connected service state with the provided MCP tools. You may propose a Termux command, but the operator must explicitly approve it before execution. Never claim to have accessed an external system unless a tool result actually provided that information. Writes, deletes, deployments, inbox mutations, and network mutations are blocked from this assistant lane.";
 
 export const MODEL_OPTIONS = [
   { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", family: "Anthropic", description: "Balanced reasoning and coding" },
@@ -108,6 +108,11 @@ export async function completeOmegaAssistant(body: unknown) {
       toolCalls += 1;
       let args: Record<string, unknown> = {};
       try { args = JSON.parse(call.function.arguments || "{}"); } catch { args = {}; }
+      if (isCommandTool(call.function.name)) {
+        const command = typeof args.command === "string" ? args.command.trim() : "";
+        if (!command) return { model: result.model || model, content: "The assistant proposed an empty Termux command, so nothing was executed.", toolsUsed: toolCalls, pendingTool: null };
+        return { model: result.model || model, content: `Command approval required before execution:\n\n\`${command}\``, toolsUsed: toolCalls, pendingTool: { name: call.function.name, arguments: args } };
+      }
       const toolResult = await callAssistantTool(bridge, mcpSession, call.function.name, args);
       mcpSession = toolResult.session;
       transcript.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: toolResult.text });
