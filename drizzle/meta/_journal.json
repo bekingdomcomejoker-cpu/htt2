@@ -8,6 +8,13 @@
       "when": 1790170552235,
       "tag": "0000_clammy_hairball",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1790173247486,
+      "tag": "0001_slim_obadiah_stane",
+      "breakpoints": true
     }
   ]
 }

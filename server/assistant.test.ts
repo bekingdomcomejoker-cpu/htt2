@@ -31,8 +31,8 @@ describe("OMEGA assistant", () => {
       ],
     });
 
-    expect(messages).toHaveLength(12);
-    expect(messages[0]).toEqual({ role: "user", content: "message-2" });
+    expect(messages).toHaveLength(14);
+    expect(messages[0]).toEqual({ role: "user", content: "message-0" });
     expect(messages.at(-1)).toEqual({ role: "user", content: "message-13" });
   });
 

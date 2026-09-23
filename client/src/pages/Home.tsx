@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { trpc } from "@/lib/trpc";
 import {
   Activity,
   BatteryCharging,
@@ -263,6 +264,18 @@ function MikrotikView({ client, notify }: { client: McpClient; notify: (text: st
 }
 function ToolsView({ client, tools, notify }: { client: McpClient; tools: Tool[]; notify: (text: string) => void }) { const [selected, setSelected] = useState<Tool | null>(null); const [args, setArgs] = useState("{}"); const [result, setResult] = useState(""); const [search, setSearch] = useState(""); const filtered = tools.filter((tool) => `${tool.name} ${tool.description}`.toLowerCase().includes(search.toLowerCase())); async function run() { if (!selected) return; try { const parsed = JSON.parse(args || "{}"); setResult(await callTool(client, selected.name, parsed)); } catch (error) { setResult(error instanceof Error ? error.message : "Tool call failed"); notify("Tool call failed"); } } return <div className="view"><SectionHead eyebrow="Capability surface / 006" title="Tool registry." copy="Every action the hub advertises, including the live Termux peer tools." action={<div className="tool-count"><Zap size={14} />{tools.length} advertised</div>} /><div className="tools-layout"><div className="tool-list"><div className="tool-search"><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filter tools..." /></div>{filtered.map((tool) => <button key={tool.name} className={`tool-row ${selected?.name === tool.name ? "selected" : ""}`} onClick={() => { setSelected(tool); setResult(""); }}><span className="tool-symbol"><Zap size={13} /></span><span><strong>{tool.name}</strong><small>{tool.description || "No description"}</small></span><ChevronDown size={15} /></button>)}</div><div className="tool-runner panel"><div className="panel-title"><span>{selected ? selected.name : "SELECT A TOOL"}</span><Settings2 size={15} /></div>{selected ? <><p className="runner-description">{selected.description}</p><label className="json-label">ARGUMENTS<textarea value={args} onChange={(event) => setArgs(event.target.value)} spellCheck={false} /></label><button className="primary-small" onClick={() => void run()}><Zap size={14} /> Run tool</button>{result && <pre className="code-output runner-output">{result}</pre>}</> : <div className="empty-runner"><Zap size={21} /><p>Choose a tool to inspect its contract and run it through the bridge.</p></div>}</div></div></div>; }
 
+type BrowserModel = { id: string; label: string; family: string; description: string };
+type StoredChatMessage = { id: number; role: "user" | "assistant"; content: string; model: string | null; createdAt: string | Date };
+
+function getBrowserClientId() {
+  const key = "omega-chat-client-id";
+  const existing = window.localStorage.getItem(key);
+  if (existing) return existing;
+  const created = `browser-${crypto.randomUUID()}`;
+  window.localStorage.setItem(key, created);
+  return created;
+}
+
 function GatewayView({ client, notify }: { client: McpClient; notify: (text: string) => void }) {
   const [command, setCommand] = useState("curl -fsS http://127.0.0.1:8787/health");
   const [prompt, setPrompt] = useState("");
@@ -273,6 +286,66 @@ function GatewayView({ client, notify }: { client: McpClient; notify: (text: str
   const [termuxReply, setTermuxReply] = useState("No Termux reply loaded.");
   const [termuxStatus, setTermuxStatus] = useState("Idle");
   const [watchingTermux, setWatchingTermux] = useState(false);
+  const [clientId] = useState(getBrowserClientId);
+  const [conversationId, setConversationId] = useState<number | null>(null);
+  const [selectedModel, setSelectedModel] = useState("claude-sonnet-4-6");
+  const creatingInitial = useRef(false);
+  const utils = trpc.useUtils();
+  const modelsQuery = trpc.chat.models.useQuery();
+  const conversationsQuery = trpc.chat.conversations.useQuery({ clientId });
+  const messagesQuery = trpc.chat.messages.useQuery(
+    { clientId, conversationId: conversationId || 0 },
+    { enabled: conversationId !== null },
+  );
+  const createConversation = trpc.chat.create.useMutation({
+    onSuccess: async (conversation) => {
+      setConversationId(conversation.id);
+      setSelectedModel(conversation.model);
+      await utils.chat.conversations.invalidate({ clientId });
+      await utils.chat.messages.invalidate({ clientId, conversationId: conversation.id });
+    },
+    onError: (error) => notify(error.message),
+  });
+  const setModel = trpc.chat.setModel.useMutation({ onError: (error) => notify(error.message) });
+  const askConversation = trpc.chat.ask.useMutation({
+    onSuccess: async (result) => {
+      setOutput(`[${result.model}]\n\n${result.content}`);
+      setPrompt("");
+      setSent(true);
+      notify("Manus assistant replied and saved the message");
+      if (conversationId !== null) {
+        await utils.chat.messages.invalidate({ clientId, conversationId });
+        await utils.chat.conversations.invalidate({ clientId });
+      }
+    },
+    onError: (error) => {
+      setOutput(error.message);
+      notify("Assistant request failed");
+    },
+    onSettled: () => setBusy(false),
+  });
+
+  useEffect(() => {
+    if (conversationId !== null || conversationsQuery.isLoading || creatingInitial.current) return;
+    const first = conversationsQuery.data?.[0];
+    if (first) {
+      setConversationId(first.id);
+      setSelectedModel(first.model);
+      return;
+    }
+    creatingInitial.current = true;
+    createConversation.mutate({ clientId, title: "OMEGA assistant chat", model: selectedModel as never });
+  }, [clientId, conversationId, conversationsQuery.data, conversationsQuery.isLoading]);
+
+  useEffect(() => {
+    const latest = messagesQuery.data?.at(-1);
+    if (latest) setOutput(`[${latest.model || selectedModel}]\n\n${latest.content}`);
+  }, [messagesQuery.data, selectedModel]);
+
+  const models = (modelsQuery.data || []) as BrowserModel[];
+  const activeConversation = conversationsQuery.data?.find((conversation) => conversation.id === conversationId);
+  const currentMessages = (messagesQuery.data || []) as StoredChatMessage[];
+
   async function run() {
     if (!command.trim()) return;
     setBusy(true); setSent(false);
@@ -280,52 +353,40 @@ function GatewayView({ client, notify }: { client: McpClient; notify: (text: str
     catch (error) { setOutput(error instanceof Error ? error.message : "Cloud CLI request failed"); notify("Cloud CLI request failed"); }
     finally { setBusy(false); }
   }
-  async function askManus() {
-    if (!prompt.trim()) return;
+
+  function askManus() {
+    if (!prompt.trim() || !conversationId || askConversation.isPending) return;
     setBusy(true); setSent(false);
-    try {
-      const response = await fetch("/api/llm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt: prompt.trim() }) });
-      const payload = await response.json();
-      if (!response.ok || !payload.ok) throw new Error(payload.error || `Assistant request failed (${response.status})`);
-      setOutput(`[${payload.model}]\n\n${payload.content}`); setPrompt(""); setSent(true); notify("Manus assistant replied");
-    } catch (error) { setOutput(error instanceof Error ? error.message : "Assistant request failed"); notify("Assistant request failed"); }
-    finally { setBusy(false); }
+    askConversation.mutate({ clientId, conversationId, model: selectedModel as never, prompt: prompt.trim() });
   }
+
+  function chooseModel(model: string) {
+    setSelectedModel(model);
+    if (conversationId) setModel.mutate({ clientId, conversationId, model: model as never });
+  }
+
+  function newChat() {
+    createConversation.mutate({ clientId, title: "New OMEGA chat", model: selectedModel as never });
+  }
+
   async function sendToTermux() {
     if (!termuxMessage.trim()) return;
-    setBusy(true);
-    setTermuxStatus("Queued · waiting for Termux");
-    setWatchingTermux(true);
-    try { await callTool(client, "inbox_post", { to: "termux", body: termuxMessage.trim() }); setTermuxMessage(""); setTermuxReply("Message delivered to the Omega inbox. Waiting for a Termux reply..."); notify("Message sent to Termux"); }
-    catch (error) { setTermuxReply(error instanceof Error ? error.message : "Termux relay failed"); notify("Termux relay failed"); }
+    setBusy(true); setTermuxStatus("Sending...");
+    try { await callTool(client, "inbox_post", { to: "termux", body: termuxMessage.trim() }); setTermuxMessage(""); setTermuxStatus("Queued"); notify("Message queued for Termux"); }
+    catch (error) { setTermuxStatus(error instanceof Error ? error.message : "Send failed"); notify("Termux message failed"); }
     finally { setBusy(false); }
   }
+
   async function loadTermuxReplies() {
-    setBusy(true);
-    try { setTermuxReply(await callTool(client, "inbox_read", { for: "*" })); setTermuxStatus("Inbox refreshed"); notify("Termux replies loaded"); }
-    catch (error) { setTermuxReply(error instanceof Error ? error.message : "Could not load Termux replies"); notify("Reply load failed"); }
-    finally { setBusy(false); }
+    setBusy(true); setWatchingTermux(true); setTermuxStatus("Loading inbox...");
+    try { const text = await callTool(client, "inbox_read", { for: "*" }); setTermuxReply(text); setTermuxStatus("Loaded"); }
+    catch (error) { setTermuxStatus(error instanceof Error ? error.message : "Load failed"); }
+    finally { setBusy(false); setWatchingTermux(false); }
   }
-  useEffect(() => {
-    if (!watchingTermux) return;
-    let active = true;
-    let attempts = 0;
-    const poll = async () => {
-      attempts += 1;
-      try {
-        const reply = await callTool(client, "inbox_read", { for: "*" });
-        if (active) { setTermuxReply(reply); setTermuxStatus("Live · inbox refreshed"); }
-      } catch (error) {
-        if (active) setTermuxStatus(error instanceof Error ? "Relay read failed" : "Relay read failed");
-      }
-      if (attempts >= 20 && active) { setWatchingTermux(false); setTermuxStatus("Watching paused · press Load replies"); }
-    };
-    void poll();
-    const timer = window.setInterval(() => void poll(), 3000);
-    return () => { active = false; window.clearInterval(timer); };
-  }, [client, watchingTermux]);
-  return <div className="view"><SectionHead eyebrow="Cloud gateway / 007" title="Your CLI in the cloud." copy="Ask the Manus assistant from this browser surface first. The separate command lane still executes through the authenticated Render Omega hub to Termux; local-model routing can be added later." action={<Badge tone={sent ? "live" : "neutral"}>{sent ? "ASSISTANT ONLINE" : "MANUS LLM"}</Badge>} /><div className="gateway-grid"><div className="terminal-panel gateway-terminal"><div className="terminal-top"><div className="terminal-dots"><i /><i /><i /></div><span>omega-cloud-cli / assistant + termux</span><Badge tone="live">DUAL PATH</Badge></div><div className="terminal-output gateway-output"><div className="output-line"><span className="prompt">omega@cloud:$</span> {command}</div><pre>{output}</pre>{busy && <div className="running-line"><Loader2 size={14} className="spin" /> processing request...</div>}</div><div className="terminal-input"><span>$</span><input value={command} onChange={(event) => setCommand(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !busy) void run(); }} spellCheck={false} /><button onClick={() => void run()} disabled={busy || !command.trim()}>{busy ? <Loader2 size={15} className="spin" /> : <Send size={15} />} Run on Termux</button></div></div><div className="panel gateway-composer"><div className="panel-title"><span>ASK THE MANUS ASSISTANT</span><Command size={15} /></div><p>This lane calls the server-side Manus LLM integration. The Forge credential stays on the server and is never sent to the browser. It is separate from the Termux command lane.</p><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void askManus(); } }} placeholder="Ask the Manus assistant anything..." /><button className="primary-small" onClick={() => void askManus()} disabled={busy || !prompt.trim()}>{busy ? <Loader2 size={14} className="spin" /> : <Command size={14} />} Ask Manus</button><div className="gateway-contract"><span>ASSISTANT PATH</span><code>browser → Manus server → built-in LLM</code><span>TERMUX PATH</span><code>browser → Render hub → reverse bridge → Termux</code></div></div><div className="panel gateway-composer gateway-relay"><div className="panel-title"><span>TWO-WAY TERMUX RELAY</span><Send size={15} /></div><p>Send a message to the phone CLI, then load the response from the existing Omega inbox.</p><textarea value={termuxMessage} onChange={(event) => setTermuxMessage(event.target.value)} placeholder="Message the Termux CLI..." /><div className="gateway-relay-actions"><button className="primary-small" onClick={() => void sendToTermux()} disabled={busy || !termuxMessage.trim()}>{busy ? <Loader2 size={14} className="spin" /> : <Send size={14} />} Send to Termux</button><button className="outline-button" onClick={() => void loadTermuxReplies()} disabled={busy}><RefreshCw size={14} /> Load replies</button></div><div className="gateway-status">{termuxStatus}</div><pre className="gateway-reply">{termuxReply}</pre></div></div><div className="notice"><ShieldCheck size={16} /><span>The assistant uses the server-side Manus LLM integration. The hub key remains a browser-session credential, and the Manus Forge credential remains server-side.</span></div></div>;
+
+  return <div className="view"><SectionHead eyebrow="Cloud gateway / 007" title="Your CLI in the cloud." copy="Choose a model, ask the Manus assistant, and keep the conversation across browser refreshes. The separate command lane still executes through the authenticated Render Omega hub to Termux." action={<Badge tone={sent ? "live" : "neutral"}>{sent ? "ASSISTANT ONLINE" : "MANUS LLM"}</Badge>} /><div className="gateway-grid"><div className="terminal-panel gateway-terminal"><div className="terminal-top"><div className="terminal-dots"><i /><i /><i /></div><span>omega-cloud-cli / assistant + termux</span><Badge tone="live">DUAL PATH</Badge></div><div className="terminal-output gateway-output"><div className="output-line"><span className="prompt">omega@cloud:$</span> {command}</div><pre>{output}</pre>{busy && <div className="running-line"><Loader2 size={14} className="spin" /> processing request...</div>}</div><div className="terminal-input"><span>$</span><input value={command} onChange={(event) => setCommand(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !busy) void run(); }} spellCheck={false} /><button onClick={() => void run()} disabled={busy || !command.trim()}>{busy ? <Loader2 size={15} className="spin" /> : <Send size={15} />} Run on Termux</button></div></div><div className="panel gateway-composer"><div className="panel-title"><span>ASK THE MANUS ASSISTANT</span><Command size={15} /></div><p>This lane calls the server-side Manus LLM. The Forge credential stays on the server and is never sent to the browser.</p><div className="chat-toolbar"><label>MODEL<select value={selectedModel} onChange={(event) => chooseModel(event.target.value)} disabled={modelsQuery.isLoading || createConversation.isPending}>{models.map((model) => <option key={model.id} value={model.id}>{model.label} · {model.family}</option>)}</select></label><button className="outline-button" onClick={newChat} disabled={createConversation.isPending}><BookmarkPlus size={14} /> New chat</button></div><div className="chat-memory"><span>{activeConversation?.title || "Starting browser memory..."}</span><small>{currentMessages.length} saved messages · refresh-safe</small></div><div className="chat-history">{currentMessages.slice(-6).map((message) => <div className={`history-line ${message.role}`} key={message.id}><b>{message.role === "user" ? "YOU" : "MANUS"}</b><span>{message.content}</span></div>)}</div><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); askManus(); } }} placeholder="Ask the Manus assistant anything..." /><button className="primary-small" onClick={askManus} disabled={busy || askConversation.isPending || !prompt.trim() || !conversationId}>{busy || askConversation.isPending ? <Loader2 size={14} className="spin" /> : <Command size={14} />} Ask Manus</button><div className="gateway-contract"><span>ASSISTANT PATH</span><code>browser → server → selected model → database history</code><span>TERMUX PATH</span><code>browser → Render hub → reverse bridge → Termux</code></div></div><div className="panel gateway-composer gateway-relay"><div className="panel-title"><span>TWO-WAY TERMUX RELAY</span><Send size={15} /></div><p>Send a message to the phone CLI, then load the response from the existing Omega inbox.</p><textarea value={termuxMessage} onChange={(event) => setTermuxMessage(event.target.value)} placeholder="Message the Termux CLI..." /><div className="gateway-relay-actions"><button className="primary-small" onClick={() => void sendToTermux()} disabled={busy || !termuxMessage.trim()}>{busy ? <Loader2 size={14} className="spin" /> : <Send size={14} />} Send to Termux</button><button className="outline-button" onClick={() => void loadTermuxReplies()} disabled={busy}><RefreshCw size={14} /> {watchingTermux ? "Loading..." : "Load replies"}</button></div><div className="gateway-status">{termuxStatus}</div><pre className="gateway-reply">{termuxReply}</pre></div></div><div className="notice"><ShieldCheck size={16} /><span>Chat history is stored server-side for this browser's local client ID. The Forge credential remains server-side; clearing browser storage starts a new local identity.</span></div></div>;
 }
+
 function InboxView({ client, snap, notify }: { client: McpClient; snap: Snapshot | null; notify: (text: string) => void }) { const [messages, setMessages] = useState(snap?.inbox || []); const [body, setBody] = useState(""); const [busy, setBusy] = useState(false); async function reload() { try { const text = await callTool(client, "inbox_read", { for: "*" }); const parsed = jsonText(text); if (Array.isArray(parsed)) setMessages(parsed); } catch (error) { notify(error instanceof Error ? error.message : "Inbox read failed"); } } async function send() { if (!body.trim()) return; setBusy(true); try { await callTool(client, "inbox_post", { to: "termux", body: body.trim() }); setBody(""); await reload(); notify("Message queued for Termux"); } catch (error) { notify(error instanceof Error ? error.message : "Message failed"); } finally { setBusy(false); } } return <div className="view"><SectionHead eyebrow="Peer messaging / 006" title="Inbox relay." copy="Leave messages on the hub for the reverse-connected node, even when it is briefly offline." action={<button className="outline-button" onClick={() => void reload()}><RefreshCw size={14} /> Refresh</button>} /><div className="inbox-grid"><div className="panel composer"><div className="panel-title"><span>POST TO TERMUX</span><Send size={15} /></div><textarea value={body} onChange={(event) => setBody(event.target.value)} placeholder="Write a message for the connected phone..." /><button className="primary-small" onClick={() => void send()} disabled={busy || !body.trim()}>{busy ? <Loader2 size={14} className="spin" /> : <Send size={14} />} Queue message</button></div><div className="panel message-list"><div className="panel-title"><span>RECENT MESSAGES</span><span className="message-count">{messages.length}</span></div>{messages.length ? messages.map((message) => <div className="message" key={message.id}><div className="message-meta"><span>{message.to}</span><time>{new Date(message.at).toLocaleString()}</time></div><p>{message.body}</p></div>) : <div className="empty-runner"><Send size={20} /><p>No messages waiting on the hub.</p></div>}</div></div></div>; }
 
 export default function Home() {
