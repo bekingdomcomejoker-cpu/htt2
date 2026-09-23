@@ -351,15 +351,24 @@ function GatewayView({ client, notify }: { client: McpClient; notify: (text: str
   const executeCommand = trpc.chat.execute.useMutation({
     onSuccess: async (result) => {
       setPendingCommand(null);
-      setOutput(`[${result.model}]\n\n${result.content}`);
-      setSent(true);
-      notify("Approved Termux command executed");
       if (conversationId !== null) {
         await utils.chat.messages.invalidate({ clientId, conversationId });
         await utils.chat.conversations.invalidate({ clientId });
+        // Wait for the persisted assistant message before updating the visible
+        // output. Otherwise the messages query can briefly return its cached
+        // pre-approval value and overwrite the command result until reload.
+        await utils.chat.messages.refetch({ clientId, conversationId });
       }
+      setOutput(`[${result.model}]\n\n${result.content}`);
+      setPrompt("");
+      setSent(true);
+      notify("Approved Termux command executed");
     },
-    onError: (error) => notify(error.message),
+    onError: (error) => {
+      setOutput(error.message);
+      notify("Approved Termux command failed");
+    },
+    onSettled: () => setBusy(false),
   });
 
   useEffect(() => {
