@@ -1,11 +1,14 @@
 import { ENV } from "./_core/env";
 import type { InvokeResult, Message } from "./_core/llm";
+import { callAssistantTool, discoverAssistantTools, modelToolsForMcp, type McpBridgeConfig } from "./mcp";
 
-const MAX_PROMPT_CHARS = 12000;
-const MAX_CONTEXT_MESSAGES = 24;
+export const MAX_PROMPT_CHARS = 120000;
+const MAX_CONTEXT_MESSAGES = 80;
+const MAX_OUTPUT_TOKENS = 8000;
+const MAX_MCP_ROUNDS = 6;
 const DEFAULT_MODEL = "claude-sonnet-4-6" as const;
 const SYSTEM_PROMPT =
-  "You are the OMEGA cloud assistant. Be precise, practical, and honest about what you can or cannot execute. Do not claim to have accessed Termux, the VPS, or external systems unless a separate tool call actually provided that result.";
+  "You are the OMEGA cloud assistant. Be precise, practical, and honest about what you can or cannot execute. You may use the provided read-only OMEGA MCP tools to inspect mesh, Termux, and connected service state. Never claim to have accessed an external system unless a tool result actually provided that information. Command execution, writes, deletes, deployments, and network mutations are blocked from this assistant lane.";
 
 export const MODEL_OPTIONS = [
   { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", family: "Anthropic", description: "Balanced reasoning and coding" },
@@ -20,23 +23,17 @@ export const MODEL_OPTIONS = [
 ] as const;
 
 export type ChatModel = (typeof MODEL_OPTIONS)[number]["id"];
+type IncomingMessage = { role?: unknown; content?: unknown };
+type ForgeMessage = Record<string, unknown>;
+type ForgeResponse = InvokeResult & { choices: Array<{ message: { role: string; content?: unknown; tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }; finish_reason: string | null }> };
 
-type IncomingMessage = {
-  role?: unknown;
-  content?: unknown;
-};
-type ForgeResponse = InvokeResult;
+type AssistantBody = { model?: unknown; messages?: unknown; prompt?: unknown; bridge?: McpBridgeConfig };
 
-export function isChatModel(value: unknown): value is ChatModel {
-  return MODEL_OPTIONS.some((option) => option.id === value);
-}
+export function isChatModel(value: unknown): value is ChatModel { return MODEL_OPTIONS.some((option) => option.id === value); }
 
 export function normalizeAssistantMessages(body: unknown): Message[] {
-  const payload = body && typeof body === "object" ? body as { messages?: unknown; prompt?: unknown } : {};
-  const requestedMessages = Array.isArray(payload.messages)
-    ? payload.messages
-    : [{ role: "user", content: payload.prompt }];
-
+  const payload = body && typeof body === "object" ? body as AssistantBody : {};
+  const requestedMessages = Array.isArray(payload.messages) ? payload.messages : [{ role: "user", content: payload.prompt }];
   return requestedMessages
     .filter((message): message is IncomingMessage => {
       if (!message || typeof message !== "object") return false;
@@ -44,56 +41,77 @@ export function normalizeAssistantMessages(body: unknown): Message[] {
       return ["system", "user", "assistant"].includes(String(candidate.role)) && typeof candidate.content === "string";
     })
     .slice(-MAX_CONTEXT_MESSAGES)
-    .map(message => ({
-      role: message.role as "system" | "user" | "assistant",
-      content: String(message.content).slice(0, MAX_PROMPT_CHARS),
-    }));
+    .map(message => ({ role: message.role as "system" | "user" | "assistant", content: String(message.content).slice(0, MAX_PROMPT_CHARS) }));
 }
 
 export function extractAssistantText(result: ForgeResponse): string {
   const content = result.choices[0]?.message?.content;
   if (typeof content === "string") return content.trim();
-  if (Array.isArray(content)) {
-    return content
-      .filter((part): part is { type: "text"; text: string } => part.type === "text")
-      .map(part => part.text)
-      .join("\n")
-      .trim();
-  }
+  if (Array.isArray(content)) return content.filter((part): part is { type: "text"; text: string } => Boolean(part && typeof part === "object" && (part as { type?: unknown }).type === "text")).map(part => part.text).join("\n").trim();
   return "";
 }
 
-export async function completeOmegaAssistant(body: unknown) {
-  const payload = body && typeof body === "object" ? body as { model?: unknown } : {};
-  const model: ChatModel = isChatModel(payload.model) ? payload.model : DEFAULT_MODEL;
-  const messages = normalizeAssistantMessages(body);
-  if (!messages.some(message => message.role === "user" && typeof message.content === "string" && message.content.trim())) {
-    throw new Error("A user prompt is required.");
+function modelToolRequest(model: ChatModel, messages: ForgeMessage[], tools?: ReturnType<typeof modelToolsForMcp>) {
+  const request: Record<string, unknown> = { model, messages };
+  if (tools?.length) {
+    request.tools = tools;
+    request.tool_choice = "auto";
   }
+  if (model.startsWith("gpt-")) request.max_completion_tokens = MAX_OUTPUT_TOKENS;
+  else request.max_tokens = MAX_OUTPUT_TOKENS;
+  return request;
+}
 
+async function forgeCompletion(model: ChatModel, messages: ForgeMessage[], tools?: ReturnType<typeof modelToolsForMcp>) {
   const apiKey = ENV.forgeApiKey;
   if (!apiKey) throw new Error("Forge backend is not configured on this deployment.");
   const baseUrl = (ENV.forgeApiUrl || "https://forge.manus.ai").replace(/\/+$/, "");
-  const request: Record<string, unknown> = {
-    model,
-    messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
-  };
-  if (model.startsWith("gpt-")) request.max_completion_tokens = 1400;
-  else request.max_tokens = 1400;
-
   const response = await fetch(`${baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(request),
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify(modelToolRequest(model, messages, tools)),
   });
   const result = await response.json().catch(() => null) as ForgeResponse | { error?: { message?: string } } | null;
-  if (!response.ok) {
-    throw new Error((result as { error?: { message?: string } } | null)?.error?.message || `Forge request failed (${response.status})`);
+  if (!response.ok) throw new Error((result as { error?: { message?: string } } | null)?.error?.message || `Forge request failed (${response.status})`);
+  return result as ForgeResponse;
+}
+
+export async function completeOmegaAssistant(body: unknown) {
+  const payload = body && typeof body === "object" ? body as AssistantBody : {};
+  const model: ChatModel = isChatModel(payload.model) ? payload.model : DEFAULT_MODEL;
+  const messages = normalizeAssistantMessages(body);
+  if (!messages.some(message => message.role === "user" && typeof message.content === "string" && message.content.trim())) throw new Error("A user prompt is required.");
+
+  let mcpTools: ReturnType<typeof modelToolsForMcp> = [];
+  let mcpSession: string | null = null;
+  const bridge = payload.bridge && typeof payload.bridge === "object" ? payload.bridge : undefined;
+  if (bridge?.url && bridge.key) {
+    const discovered = await discoverAssistantTools(bridge);
+    mcpTools = modelToolsForMcp(discovered.tools);
+    mcpSession = discovered.session;
   }
-  const content = extractAssistantText(result as ForgeResponse);
-  if (!content) throw new Error("Forge returned an empty response.");
-  return { model: (result as ForgeResponse).model || model, content };
+
+  const transcript: ForgeMessage[] = [{ role: "system", content: SYSTEM_PROMPT }, ...messages.map(message => ({ role: message.role, content: message.content as string }))];
+  let toolCalls = 0;
+  for (let round = 0; round <= MAX_MCP_ROUNDS; round += 1) {
+    const result = await forgeCompletion(model, transcript, mcpTools);
+    const assistantMessage = result.choices[0]?.message;
+    if (!assistantMessage) throw new Error("Forge returned an empty response.");
+    const calls = assistantMessage.tool_calls || [];
+    if (!calls.length || !bridge) {
+      const content = extractAssistantText(result);
+      if (!content) throw new Error("Forge returned an empty response.");
+      return { model: result.model || model, content, toolsUsed: toolCalls };
+    }
+    transcript.push({ role: "assistant", content: assistantMessage.content ?? null, tool_calls: calls });
+    for (const call of calls.slice(0, 4)) {
+      toolCalls += 1;
+      let args: Record<string, unknown> = {};
+      try { args = JSON.parse(call.function.arguments || "{}"); } catch { args = {}; }
+      const toolResult = await callAssistantTool(bridge, mcpSession, call.function.name, args);
+      mcpSession = toolResult.session;
+      transcript.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: toolResult.text });
+    }
+  }
+  throw new Error("The MCP tool loop reached its safety limit before the assistant produced a final response.");
 }

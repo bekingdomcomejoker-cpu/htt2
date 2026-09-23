@@ -5,9 +5,10 @@ import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router } from "./_core/trpc";
 import { addChatMessage, createConversation, getConversation, listChatMessages, listConversations, updateConversationModel } from "./db";
 import { completeOmegaAssistant, MODEL_OPTIONS, type ChatModel } from "./assistant";
-
+import type { McpBridgeConfig } from "./mcp";
 const clientIdSchema = z.string().min(16).max(128);
 const modelSchema = z.enum(MODEL_OPTIONS.map((option) => option.id) as [ChatModel, ...ChatModel[]]);
+const bridgeSchema = z.object({ url: z.string().url().max(500), key: z.string().min(8).max(512) }).optional();
 
 export const appRouter = router({
   system: systemRouter,
@@ -30,14 +31,14 @@ export const appRouter = router({
       await updateConversationModel(input.clientId, input.conversationId, input.model);
       return { model: input.model };
     }),
-    ask: publicProcedure.input(z.object({ clientId: clientIdSchema, conversationId: z.number().int().positive(), model: modelSchema, prompt: z.string().trim().min(1).max(12000) })).mutation(async ({ input }) => {
+    ask: publicProcedure.input(z.object({ clientId: clientIdSchema, conversationId: z.number().int().positive(), model: modelSchema, prompt: z.string().trim().min(1).max(120000), bridge: bridgeSchema })).mutation(async ({ input }) => {
       const conversation = await getConversation(input.clientId, input.conversationId);
       if (!conversation) throw new Error("Conversation not found.");
       const history = await listChatMessages(input.clientId, input.conversationId);
       const messages = [...history.map((message) => ({ role: message.role, content: message.content })), { role: "user" as const, content: input.prompt }];
       await addChatMessage({ conversationId: input.conversationId, role: "user", content: input.prompt, model: input.model });
       try {
-        const result = await completeOmegaAssistant({ model: input.model, messages });
+        const result = await completeOmegaAssistant({ model: input.model, messages, bridge: input.bridge as McpBridgeConfig | undefined });
         await addChatMessage({ conversationId: input.conversationId, role: "assistant", content: result.content, model: result.model });
         return result;
       } catch (error) {
