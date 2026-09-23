@@ -6,6 +6,7 @@ import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerOAuthRoutes } from "./oauth";
 import { registerStorageProxy } from "./storageProxy";
 import { appRouter } from "../routers";
+import { completeOmegaAssistant } from "../assistant";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
 
@@ -36,6 +37,16 @@ async function startServer() {
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
   registerStorageProxy(app);
   registerOAuthRoutes(app);
+  app.post("/api/llm", async (req, res) => {
+    try {
+      const result = await completeOmegaAssistant(req.body);
+      res.json({ ok: true, ...result });
+    } catch (error) {
+      console.error("[LLM] Request failed", error);
+      const message = error instanceof Error ? error.message : "Assistant request failed";
+      res.status(message === "A user prompt is required." ? 400 : 502).json({ ok: false, error: message });
+    }
+  });
   // tRPC API
   app.use(
     "/api/trpc",
