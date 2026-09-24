@@ -34,3 +34,9 @@ Command execution, shell/exec, inbox writes, file writes/deletes, deployment act
 The chat prompt ceiling was increased from 12,000 to 120,000 characters, context history to 80 messages, and model output to 8,000 tokens per completion. An organigram describing the dual pipeline and permission boundary is in `docs/OMEGA_MCP_ORGANIGRAM.md`.
 
 Validation: TypeScript check passed, 8 Vitest tests passed, and production build passed. The MCP round-trip test verifies that a model tool call receives a simulated `TERMUX_LIVE` result and produces a final answer.
+
+## Shared OMEGA release synchronization — 2026-09-24 UTC
+
+Synchronized the verified application source from the current `htt4` release into this existing `htt2` repository without replacing its historical documentation. The synchronized source includes the current Cloud/Local CLI model work, pipeline and online-agent integrations, persistent chat memory, the Sandbox Shell tab with command history and streamed output, and the latest server-side relay tests. The canonical hub URL repair remains in the existing `htt` repository.
+
+Validation passed after synchronization: `pnpm check`, `pnpm test` (**19 Vitest tests**), `pnpm build`, and `git diff --check`. A local rollback branch named `pre-sync-2026-09-24` was created before applying the source update.

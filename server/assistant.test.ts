@@ -1,9 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { InvokeResult } from "./_core/llm";
-import { completeOmegaAssistant, extractAssistantText, normalizeAssistantMessages, MAX_PROMPT_CHARS } from "./assistant";
+vi.mock("./_core/env", () => ({
+  ENV: { forgeApiUrl: "https://forge.example.test", forgeApiKey: "test-forge-key", localLlmApiUrl: "http://127.0.0.1:11434", localLlmApiKey: "" },
+}));
+import { checkLocalProvider, completeOmegaAssistant, extractAssistantText, normalizeAssistantMessages, MAX_PROMPT_CHARS } from "./assistant";
 
 function result(content: string): InvokeResult {
-  return { id: "test-response", created: 0, model: "claude-sonnet-4-6", choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }] };
+  return { id: "test-response", created: 0, model: "claude-sonnet-4-6", choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }], usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 } };
 }
 
 const bridge = { url: "https://omega.example", key: "test-hub-key-123" };
@@ -22,8 +25,37 @@ describe("OMEGA assistant", () => {
   });
 
   it("uses the server-side Forge transport and returns the assistant text", async () => {
-    await expect(completeOmegaAssistant({ prompt: "Reply with exactly OMEGA_ASSISTANT_OK" })).resolves.toEqual({ model: "claude-sonnet-4-6", content: "OMEGA_ASSISTANT_OK", toolsUsed: 0 });
+    await expect(completeOmegaAssistant({ prompt: "Reply with exactly OMEGA_ASSISTANT_OK" })).resolves.toMatchObject({ model: "claude-sonnet-4-6", content: "OMEGA_ASSISTANT_OK", toolsUsed: 0, usage: { promptTokens: 12, completionTokens: 8, totalTokens: 20, requests: 1 } });
     expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/v1/chat/completions"), expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "Content-Type": "application/json" }) }));
+  });
+
+  it("routes the local model through the Ollama-compatible endpoint", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ...result("OMEGA_ASSISTANT_OK"), model: "qwen2.5:7b" }), { status: 200, headers: { "content-type": "application/json" } })));
+    await expect(completeOmegaAssistant({ model: "local-qwen2.5-7b", prompt: "Reply with exactly LOCAL_MODEL_OK" })).resolves.toMatchObject({ model: "qwen2.5:7b", content: "OMEGA_ASSISTANT_OK", usage: { requests: 1 } });
+    expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:11434/v1/chat/completions", expect.objectContaining({ method: "POST", headers: { "Content-Type": "application/json" } }));
+  });
+
+  it("reports local provider health and latency", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ data: [{ id: "qwen2.5:7b" }] }), { status: 200, headers: { "content-type": "application/json" } })));
+    await expect(checkLocalProvider()).resolves.toMatchObject({ ok: true, model: "qwen2.5:7b", endpoint: "http://127.0.0.1:11434", latencyMs: expect.any(Number) });
+  });
+
+  it("authenticates against the configured live Ollama endpoint", async () => {
+    const endpoint = process.env.LOCAL_LLM_API_URL;
+    const key = process.env.LOCAL_LLM_API_KEY;
+    if (!endpoint || !key || endpoint.includes("127.0.0.1")) return;
+    vi.unstubAllGlobals();
+    const response = await fetch(`${endpoint}/v1/models`, { headers: { Authorization: `Bearer ${key}` } });
+    expect(response.ok).toBe(true);
+    expect((await response.json()).data.some((model: { id?: string }) => model.id === "qwen2.5:7b")).toBe(true);
+  });
+
+  it("injects bounded persistent memory into the system context", async () => {
+    await completeOmegaAssistant({ prompt: "Use my preference", memoryContext: "- Prefers concise deployment notes" });
+    const request = (fetch as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as RequestInit;
+    const body = JSON.parse(String(request.body));
+    expect(body.messages[0].content).toContain("Persistent operator memory");
+    expect(body.messages[0].content).toContain("Prefers concise deployment notes");
   });
 
   it("accepts the expanded prompt ceiling", () => {
@@ -41,7 +73,7 @@ describe("OMEGA assistant", () => {
       new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: "Termux is live." }, finish_reason: "stop" }], model: "claude-sonnet-4-6" }), { status: 200, headers: { "content-type": "application/json" } }),
     ];
     vi.stubGlobal("fetch", vi.fn(async () => responses.shift()!));
-    await expect(completeOmegaAssistant({ prompt: "Check the mesh", bridge })).resolves.toEqual({ model: "claude-sonnet-4-6", content: "Termux is live.", toolsUsed: 1 });
+    await expect(completeOmegaAssistant({ prompt: "Check the mesh", bridge })).resolves.toMatchObject({ model: "claude-sonnet-4-6", content: "Termux is live.", toolsUsed: 1, usage: { requests: 2 } });
     expect(fetch).toHaveBeenCalledTimes(6);
     expect(String((fetch as ReturnType<typeof vi.fn>).mock.calls[4]?.[0])).toContain("/mcp");
   });

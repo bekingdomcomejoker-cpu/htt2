@@ -1,23 +1,33 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { trpc } from "@/lib/trpc";
 import { ChatMessageContent } from "@/components/ChatMessageContent";
+import PipelineView from "@/components/PipelineView";
+import { ModelChatView } from "@/components/ModelChatView";
+import { SandboxShellView } from "@/components/SandboxShellView";
+import { formatLornaAgentProbe, formatOnlineAgentPrompt } from "@shared/onlineAgent";
+import { parseOperatorSession, serializeOperatorSession } from "@shared/operatorSession";
 import {
-  Activity,
-  BatteryCharging,
-  BookmarkPlus,
-  ChevronDown,
-  CircleDot,
+	  Activity,
+	  BatteryCharging,
+	  BookmarkPlus,
+	  ChevronDown,
+	  ChevronLeft,
+	  ChevronRight,
+	  CircleDot,
   Clipboard,
-  Cloud,
-  Command,
+	  Cloud,
+	  Command,
+	  Cpu,
   FileCode2,
   FolderOpen,
+  GitBranch,
   Github,
   KeyRound,
   Link2,
   Loader2,
   LockKeyhole,
   Menu,
+  MessageCircle,
   Network,
   Radio,
   RefreshCw,
@@ -27,6 +37,7 @@ import {
   Server,
   Settings2,
   ShieldCheck,
+  Sparkles,
   TerminalSquare,
   Trash2,
   Wifi,
@@ -38,7 +49,7 @@ const DEFAULT_URL = "https://omega-hub-canonical.onrender.com";
 
 type Tool = { name: string; description?: string; inputSchema?: Record<string, unknown> };
 type Health = { ok: boolean; service?: string; transport?: string; port?: number; peers?: { vps?: string; termux?: string } };
-type Snapshot = { peers?: Array<{ id: string; name: string; role: string; via: string; status: string; lastSeen: string | null; tools: string[]; latencyMs: number | null }>; inbox?: Array<{ id: string; to: string; body: string; at: string }>; termuxLastError?: string | null; reverseConnect?: { url?: string | null } };
+type Snapshot = { peers?: Array<{ id: string; name: string; role: string; via: string; status: string; lastSeen: string | null; tools: string[]; latencyMs: number | null }>; inbox?: Array<{ id: string; to: string; from?: string; body: string; at: string }>; termuxLastError?: string | null; reverseConnect?: { url?: string | null } };
 
 type McpClient = { url: string; key: string; session: string | null };
 
@@ -112,8 +123,8 @@ function Badge({ children, tone = "neutral" }: { children: ReactNode; tone?: "ne
 function IconButton({ children, onClick, label }: { children: ReactNode; onClick?: () => void; label: string }) { return <button type="button" className="icon-button" onClick={onClick} aria-label={label}>{children}</button>; }
 
 function Unlock({ onUnlock }: { onUnlock: (client: McpClient, tools: Tool[], health: Health) => void }) {
-  const [url, setUrl] = useState(DEFAULT_URL);
-  const [key, setKey] = useState("");
+  const [url, setUrl] = useState(() => parseOperatorSession(window.sessionStorage.getItem("omega-operator-session"))?.url || DEFAULT_URL);
+  const [key, setKey] = useState(() => parseOperatorSession(window.sessionStorage.getItem("omega-operator-session"))?.key || "");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [live, setLive] = useState<boolean | null>(null);
@@ -124,7 +135,11 @@ function Unlock({ onUnlock }: { onUnlock: (client: McpClient, tools: Tool[], hea
   async function submit(event: React.FormEvent) {
     event.preventDefault(); setBusy(true); setMessage("");
     const client: McpClient = { url, key: key.trim(), session: null };
-    try { const [result, status] = await Promise.all([listTools(client), health(url)]); onUnlock(client, result, status); }
+    try {
+      const [result, status] = await Promise.all([listTools(client), health(url)]);
+      window.sessionStorage.setItem("omega-operator-session", serializeOperatorSession({ url, key: key.trim() }));
+      onUnlock(client, result, status);
+    }
     catch (error) { setMessage(error instanceof Error ? error.message : "Unable to unlock the bridge."); }
     finally { setBusy(false); }
   }
@@ -153,6 +168,11 @@ const nav = [
   { id: "overview", label: "Overview", icon: Activity },
   { id: "terminal", label: "Terminal", icon: TerminalSquare },
   { id: "gateway", label: "Cloud CLI", icon: Command },
+  { id: "localcli", label: "Cloud Local CLI", icon: Cpu },
+  { id: "sandbox", label: "Sandbox Shell", icon: TerminalSquare },
+  { id: "pipeline", label: "HTT3 Pipeline", icon: GitBranch },
+  { id: "modelchat", label: "Model Chat", icon: MessageCircle },
+  { id: "mesh", label: "Node Mesh", icon: Network },
   { id: "files", label: "Files", icon: FolderOpen },
   { id: "network", label: "Network", icon: Network },
   { id: "router", label: "MikroTik", icon: RouterIcon },
@@ -161,8 +181,15 @@ const nav = [
 ];
 
 function AppShell({ client, initialTools, initialHealth, onLock }: { client: McpClient; initialTools: Tool[]; initialHealth: Health; onLock: () => void }) {
-  const [active, setActive] = useState("overview");
-  const [tools, setTools] = useState(initialTools);
+	  const [active, setActive] = useState("overview");
+	  const [navCollapsed, setNavCollapsed] = useState(() => {
+	    try {
+	      return localStorage.getItem("omega-nav-collapsed") === "1";
+	    } catch {
+	      return false;
+	    }
+	  });
+	  const [tools, setTools] = useState(initialTools);
   const [status, setStatus] = useState(initialHealth);
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [battery, setBattery] = useState<any>(null);
@@ -202,18 +229,19 @@ function AppShell({ client, initialTools, initialHealth, onLock }: { client: Mcp
   }, [client.url, client.key]);
   const hubLive = status.ok && status.peers?.vps === "live";
   const termuxPeer = snap?.peers?.find((peer) => peer.id === "termux");
-  return <div className="operator-app">
-    <aside className={`operator-sidebar ${mobileNav ? "open" : ""}`}>
-      <div className="operator-brand"><div className="small-mark">Ω</div><div><div className="brand-title">OMEGA <span>OPERATOR</span></div><div className="brand-caption">MESH CONTROL PLANE</div></div><IconButton label="Close navigation" onClick={() => setMobileNav(false)}><X size={17} /></IconButton></div>
+  const termuxReady = Boolean(termuxPeer?.status === "live" && termuxPeer.tools?.length);
+	  return <div className={`operator-app ${navCollapsed ? "nav-collapsed" : ""}`}>
+	    <aside className={`operator-sidebar ${mobileNav ? "open" : ""}`}>
+	      <div className="operator-brand"><div className="small-mark">Ω</div><div><div className="brand-title">OMEGA <span>OPERATOR</span></div><div className="brand-caption">MESH CONTROL PLANE</div></div><button type="button" className="nav-collapse-btn" title={navCollapsed ? "Expand navigation" : "Collapse navigation"} onClick={() => { setNavCollapsed((prev) => { const next = !prev; try { localStorage.setItem("omega-nav-collapsed", next ? "1" : "0"); } catch { /* ignore */ } return next; }); }}>{navCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}</button><IconButton label="Close navigation" onClick={() => setMobileNav(false)}><X size={17} /></IconButton></div>
       <div className="connection-card"><div className="connection-top"><span className="connection-label">BRIDGE STATUS</span><Badge tone={hubLive ? "live" : "warn"}>{hubLive ? "LIVE" : "OFFLINE"}</Badge></div><div className="connection-url"><span className="status-dot live" />{new URL(normaliseUrl(client.url)).hostname}</div><div className="connection-detail">MCP / port {status.port || "—"}</div></div>
       <div className="nav-caption">CONTROL SURFACES</div>
       <nav>{nav.map(({ id, label, icon: Icon }) => <button key={id} type="button" className={`side-nav-item ${active === id ? "active" : ""}`} onClick={() => { setActive(id); setMobileNav(false); }}><Icon size={16} /><span>{label}</span>{id === "inbox" && snap?.inbox?.length ? <b className="nav-count">{snap.inbox.length}</b> : null}</button>)}</nav>
-      <div className="sidebar-bottom"><div className="peer-mini"><div className="mini-peer"><StatusDot live={true} /><span>VPS</span><b>LIVE</b></div><div className="mini-peer"><StatusDot live={termuxPeer?.status === "live"} /><span>TERMUX</span><b>{termuxPeer?.status === "live" ? "LIVE" : "WAITING"}</b></div></div><a href="https://github.com/bekingdomcomejoker-cpu/htt" target="_blank" rel="noreferrer" className="source-link"><Github size={15} /> canonical / htt <Link2 size={13} /></a><button className="disconnect-link" onClick={onLock}><LockKeyhole size={14} /> Lock console</button></div>
+      <div className="sidebar-bottom"><div className="peer-mini"><div className="mini-peer"><StatusDot live={true} /><span>VPS</span><b>LIVE</b></div><div className="mini-peer"><StatusDot live={termuxReady} /><span>TERMUX</span><b>{termuxReady ? "LIVE" : "WAITING"}</b></div></div><a href="https://github.com/bekingdomcomejoker-cpu/htt" target="_blank" rel="noreferrer" className="source-link"><Github size={15} /> canonical / htt <Link2 size={13} /></a><button className="disconnect-link" onClick={onLock}><LockKeyhole size={14} /> Lock console</button></div>
     </aside>
     {mobileNav && <div className="mobile-overlay" onClick={() => setMobileNav(false)} />}
     <main className="operator-main">
       <header className="operator-header"><button className="mobile-menu" onClick={() => setMobileNav(true)}><Menu size={20} /></button><div className="header-title"><span>OMEGA /</span><strong>{nav.find((item) => item.id === active)?.label}</strong></div><div className="header-actions"><span className="realtime-status"><StatusDot live={realtime} />{realtime ? "LIVE SYNC" : "POLLING"}</span><span className="header-clock">{new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span><IconButton label="Refresh mesh" onClick={() => void refresh()}>{refreshing ? <Loader2 size={17} className="spin" /> : <RefreshCw size={17} />}</IconButton><div className="avatar">OP</div></div></header>
-      <div className="operator-content">{active === "overview" && <Overview status={status} snap={snap} tools={tools} battery={battery} onNavigate={setActive} />} {active === "terminal" && <TerminalView client={client} tools={tools} notify={notify} />} {active === "gateway" && <GatewayView client={client} notify={notify} />} {active === "files" && <FilesView client={client} notify={notify} />} {active === "network" && <NetworkView client={client} battery={battery} notify={notify} />} {active === "router" && <MikrotikView client={client} notify={notify} />} {active === "tools" && <ToolsView client={client} tools={tools} notify={notify} />} {active === "inbox" && <InboxView client={client} snap={snap} notify={notify} />}</div>
+      <div className="operator-content">{active === "overview" && <Overview status={status} snap={snap} tools={tools} battery={battery} onNavigate={setActive} />} {active === "terminal" && <TerminalView client={client} tools={tools} notify={notify} />} {active === "gateway" && <GatewayView client={client} notify={notify} />} {active === "localcli" && <ModelChatView client={client} notify={notify} allowedModelIds={["local-qwen2.5-7b"]} heading="Cloud Local CLI." description="Private local inference through the Qwen2.5 7B model on the configured Ollama host." />} {active === "sandbox" && <SandboxShellView client={client} notify={notify} />} {active === "pipeline" && <PipelineView client={client} notify={notify} />} {active === "modelchat" && <ModelChatView client={client} notify={notify} />} {active === "mesh" && <NodeMeshView client={client} snap={snap} notify={notify} />} {active === "files" && <FilesView client={client} notify={notify} />} {active === "network" && <NetworkView client={client} battery={battery} notify={notify} />} {active === "router" && <MikrotikView client={client} notify={notify} />} {active === "tools" && <ToolsView client={client} tools={tools} notify={notify} />} {active === "inbox" && <InboxView client={client} snap={snap} notify={notify} />}</div>
     </main>
     <div className="toast-stack">{toasts.map((toast, index) => <div className="toast" key={`${toast}-${index}`}><StatusDot live={true} />{toast}</div>)}</div>
   </div>;
@@ -223,17 +251,17 @@ function SectionHead({ eyebrow, title, copy, action }: { eyebrow: string; title:
 function Stat({ label, value, hint, icon: Icon, tone = "default" }: { label: string; value: string; hint: string; icon: any; tone?: string }) { return <div className={`metric-card tone-${tone}`}><div className="metric-top"><span>{label}</span><Icon size={17} /></div><strong>{value}</strong><small>{hint}</small></div>; }
 
 function Overview({ status, snap, tools, battery, onNavigate }: { status: Health; snap: Snapshot | null; tools: Tool[]; battery: any; onNavigate: (id: string) => void }) {
-  const vps = snap?.peers?.find((peer) => peer.id === "vps"); const termux = snap?.peers?.find((peer) => peer.id === "termux"); const pct = battery?.percentage ?? battery?.level;
+  const vps = snap?.peers?.find((peer) => peer.id === "vps"); const termux = snap?.peers?.find((peer) => peer.id === "termux"); const termuxReady = Boolean(termux?.status === "live" && termux.tools?.length); const pct = battery?.percentage ?? battery?.level;
   return <div className="view overview-view"><SectionHead eyebrow="Operator overview / 001" title="The mesh, at a glance." copy="One control plane for the VPS runtime and the reverse-connected Termux peer." action={<Badge tone={status.ok ? "live" : "warn"}>{status.ok ? "ALL SYSTEMS MAPPED" : "BRIDGE OFFLINE"}</Badge>} />
-    <div className="metric-grid"><Stat label="Bridge" value={status.ok ? "Connected" : "Down"} hint={status.service || "omega-vps"} icon={Radio} tone="cyan" /><Stat label="Tools" value={String(tools.length)} hint="advertised over MCP" icon={Zap} tone="violet" /><Stat label="Termux" value={termux?.status === "live" ? "Live" : "Waiting"} hint={termux?.tools?.length ? `${termux.tools.length} peer tools` : "start omega_reverse.py"} icon={CircleDot} tone="amber" /><Stat label="Battery" value={pct === undefined ? "—" : `${pct}%`} hint={battery?.status ? `${battery.status} · ${battery.plugged || "unplugged"}` : "Android telemetry"} icon={BatteryCharging} tone="green" /></div>
-    <div className="overview-grid"><div className="panel peer-panel"><div className="panel-title"><span>PEER FABRIC</span><button onClick={() => onNavigate("network")}>inspect network ↗</button></div><PeerRow icon={Server} name="Omega VPS" role="hub / local" status={vps?.status || "live"} detail={`${vps?.tools?.length || 0} hub tools`} tone="cyan" /><PeerRow icon={Wifi} name="Omega Termux" role="phone / reverse" status={termux?.status || "connecting"} detail={termux?.tools?.length ? `${termux.tools.length} tools advertised` : "waiting for bridge"} tone="amber" /><div className="mesh-bar"><span>path health</span><div className="bar-track"><i style={{ width: termux?.status === "live" ? "100%" : "50%" }} /></div><b>{termux?.status === "live" ? "2 / 2" : "1 / 2"} peers live</b></div></div><div className="panel quick-panel"><div className="panel-title"><span>QUICK ACTIONS</span><Command size={15} /></div><QuickAction icon={TerminalSquare} label="Open terminal" copy="Run on VPS or Termux" onClick={() => onNavigate("terminal")} /><QuickAction icon={FolderOpen} label="Browse files" copy="Inspect the connected node" onClick={() => onNavigate("files")} /><QuickAction icon={Zap} label="Discover tools" copy={`${tools.length} tools available`} onClick={() => onNavigate("tools")} /><QuickAction icon={Send} label="Open inbox" copy={`${snap?.inbox?.length || 0} messages waiting`} onClick={() => onNavigate("inbox")} /></div></div>
-    <div className="runtime-strip"><div><span className="strip-label">CANONICAL RUNTIME</span><strong>omega-hub-canonical</strong><small>https://omega-hub-canonical.onrender.com</small></div><div className="strip-divider" /><div><span className="strip-label">REVERSE CONNECTOR</span><strong>{snap?.reverseConnect?.url ? "endpoint assigned" : "awaiting Termux"}</strong><small>{snap?.reverseConnect?.url || "Run omega_reverse.py on the phone"}</small></div><div className="strip-action"><ShieldCheck size={17} /><span>Secrets stay in runtime config</span></div></div>
+    <div className="metric-grid"><Stat label="Bridge" value={status.ok ? "Connected" : "Down"} hint={status.service || "omega-vps"} icon={Radio} tone="cyan" /><Stat label="Tools" value={String(tools.length)} hint="advertised over MCP" icon={Zap} tone="violet" /><Stat label="Termux" value={termuxReady ? "Live" : "Waiting"} hint={termux?.tools?.length ? `${termux.tools.length} peer tools` : (snap?.termuxLastError || "repair omega_reverse.py bridge")} icon={CircleDot} tone="amber" /><Stat label="Battery" value={pct === undefined ? "—" : `${pct}%`} hint={battery?.status ? `${battery.status} · ${battery.plugged || "unplugged"}` : "Android telemetry"} icon={BatteryCharging} tone="green" /></div>
+    <div className="overview-grid"><div className="panel peer-panel"><div className="panel-title"><span>PEER FABRIC</span><button onClick={() => onNavigate("network")}>inspect network ↗</button></div><PeerRow icon={Server} name="Omega VPS" role="hub / local" status={vps?.status || "live"} detail={`${vps?.tools?.length || 0} hub tools`} tone="cyan" /><PeerRow icon={Wifi} name="Omega Termux" role="phone / reverse" status={termuxReady ? "live" : "waiting"} detail={termux?.tools?.length ? `${termux.tools.length} tools advertised` : (snap?.termuxLastError || "waiting for bridge repair")} tone="amber" /><div className="mesh-bar"><span>path health</span><div className="bar-track"><i style={{ width: termuxReady ? "100%" : "50%" }} /></div><b>{termuxReady ? "2 / 2" : "1 / 2"} peers live</b></div></div><div className="panel quick-panel"><div className="panel-title"><span>QUICK ACTIONS</span><Command size={15} /></div><QuickAction icon={TerminalSquare} label="Open terminal" copy="Run on VPS or Termux" onClick={() => onNavigate("terminal")} /><QuickAction icon={FolderOpen} label="Browse files" copy="Inspect the connected node" onClick={() => onNavigate("files")} /><QuickAction icon={Zap} label="Discover tools" copy={`${tools.length} tools available`} onClick={() => onNavigate("tools")} /><QuickAction icon={Send} label="Open inbox" copy={`${snap?.inbox?.length || 0} messages waiting`} onClick={() => onNavigate("inbox")} /></div></div>
+    <div className="runtime-strip"><div><span className="strip-label">CANONICAL RUNTIME</span><strong>omega-hub-canonical</strong><small>https://omega-hub-canonical.onrender.com</small></div><div className="strip-divider" /><div><span className="strip-label">REVERSE CONNECTOR</span><strong>{termuxReady && snap?.reverseConnect?.url ? "endpoint assigned" : "bridge needs repair"}</strong><small>{termuxReady && snap?.reverseConnect?.url ? snap.reverseConnect.url : (snap?.termuxLastError || "Run omega_reverse.py with an absolute MCP URL")}</small></div><div className="strip-action"><ShieldCheck size={17} /><span>Secrets stay in runtime config</span></div></div>
   </div>;
 }
 function PeerRow({ icon: Icon, name, role, status, detail, tone }: { icon: any; name: string; role: string; status: string; detail: string; tone: string }) { const live = status === "live"; return <div className="peer-row"><div className={`peer-icon ${tone}`}><Icon size={17} /></div><div className="peer-name"><strong>{name}</strong><small>{role}</small></div><div className="peer-detail"><span className={live ? "green-text" : "amber-text"}><StatusDot live={live} />{live ? "LIVE" : "WAITING"}</span><small>{detail}</small></div></div>; }
 function QuickAction({ icon: Icon, label, copy, onClick }: { icon: any; label: string; copy: string; onClick: () => void }) { return <button className="quick-action" onClick={onClick}><span className="quick-icon"><Icon size={16} /></span><span><strong>{label}</strong><small>{copy}</small></span><span className="quick-arrow">↗</span></button>; }
 
-function TerminalView({ client, tools, notify }: { client: McpClient; tools: Tool[]; notify: (text: string) => void }) { const [target, setTarget] = useState<"vps" | "termux">("termux"); const [command, setCommand] = useState("ip route && ip -4 addr"); const [output, setOutput] = useState("Select a target and run a command."); const [busy, setBusy] = useState(false); const termuxAvailable = tools.some((tool) => tool.name === "termux_exec"); async function run() { setBusy(true); try { const text = await callTool(client, target === "termux" ? "termux_exec" : "sandbox_exec", { command, timeout: 20 }); setOutput(text); } catch (error) { setOutput(error instanceof Error ? error.message : "Command failed"); notify("Command failed"); } finally { setBusy(false); } } return <div className="view"><SectionHead eyebrow="Execution surface / 002" title="Terminal relay." copy="Run bounded commands on the VPS or the connected Termux node." action={<div className="target-switch"><button className={target === "termux" ? "selected" : ""} onClick={() => setTarget("termux")}><Wifi size={14} />Termux</button><button className={target === "vps" ? "selected" : ""} onClick={() => setTarget("vps")}><Server size={14} />VPS</button></div>} /><div className="terminal-panel"><div className="terminal-top"><div className="terminal-dots"><i /><i /><i /></div><span>{target === "termux" ? "termux@redmi13c" : "omega@vps"}:~</span><Badge tone={target === "termux" ? (termuxAvailable ? "live" : "warn") : "live"}>{target === "termux" ? (termuxAvailable ? "CONNECTED" : "WAITING") : "LOCAL"}</Badge></div><div className="terminal-output"><div className="output-line"><span className="prompt">{target === "termux" ? "termux" : "omega"}@mesh:$</span> {command}</div><pre>{output}</pre>{busy && <div className="running-line"><Loader2 size={14} className="spin" /> executing on {target}...</div>}</div><div className="terminal-input"><span>$</span><input value={command} onChange={(event) => setCommand(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !busy) void run(); }} spellCheck={false} /><button onClick={() => void run()} disabled={busy || !command.trim()}>{busy ? <Loader2 size={16} className="spin" /> : <Send size={16} />} Run</button></div></div><div className="command-hints"><span>SAFE STARTERS</span><button onClick={() => setCommand("ip route && ip -4 addr")}>network</button><button onClick={() => setCommand("pwd && ls -la")}>files</button><button onClick={() => setCommand("uname -a")}>system</button><button onClick={() => setCommand("getprop ro.product.model")}>device</button></div></div>; }
+function TerminalView({ client, tools, notify }: { client: McpClient; tools: Tool[]; notify: (text: string) => void }) { const [target, setTarget] = useState<"vps" | "termux">("termux"); const [command, setCommand] = useState("uname -a"); const [output, setOutput] = useState("Select a target and run a command."); const [busy, setBusy] = useState(false); const termuxAvailable = tools.some((tool) => tool.name === "termux_exec"); async function run() { setBusy(true); try { const text = await callTool(client, target === "termux" ? "termux_exec" : "sandbox_exec", { command, timeout: 20 }); setOutput(text); } catch (error) { setOutput(error instanceof Error ? error.message : "Command failed"); notify("Command failed"); } finally { setBusy(false); } } return <div className="view"><SectionHead eyebrow="Execution surface / 002" title="Terminal relay." copy="Run bounded commands on the VPS or the connected Termux node." action={<div className="target-switch"><button className={target === "termux" ? "selected" : ""} onClick={() => setTarget("termux")}><Wifi size={14} />Termux</button><button className={target === "vps" ? "selected" : ""} onClick={() => setTarget("vps")}><Server size={14} />VPS</button></div>} /><div className="terminal-panel"><div className="terminal-top"><div className="terminal-dots"><i /><i /><i /></div><span>{target === "termux" ? "termux@redmi13c" : "omega@vps"}:~</span><Badge tone={target === "termux" ? (termuxAvailable ? "live" : "warn") : "live"}>{target === "termux" ? (termuxAvailable ? "CONNECTED" : "WAITING") : "LOCAL"}</Badge></div><div className="terminal-output"><div className="output-line"><span className="prompt">{target === "termux" ? "termux" : "omega"}@mesh:$</span> {command}</div><pre>{output}</pre>{busy && <div className="running-line"><Loader2 size={14} className="spin" /> executing on {target}...</div>}</div><div className="terminal-input"><span>$</span><input value={command} onChange={(event) => setCommand(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !busy) void run(); }} spellCheck={false} /><button onClick={() => void run()} disabled={busy || !command.trim()}>{busy ? <Loader2 size={16} className="spin" /> : <Send size={16} />} Run</button></div></div><div className="command-hints"><span>SAFE STARTERS</span><button onClick={() => setCommand("(ip route 2>/dev/null || route -n 2>/dev/null || true) && (ip -4 addr 2>/dev/null || ifconfig 2>/dev/null || true)")}>network</button><button onClick={() => setCommand("pwd && ls -la")}>files</button><button onClick={() => setCommand("uname -a")}>system</button><button onClick={() => setCommand("getprop ro.product.model")}>device</button></div></div>; }
 
 function FilesView({ client, notify }: { client: McpClient; notify: (text: string) => void }) { const [path, setPath] = useState("$HOME"); const [output, setOutput] = useState("No directory loaded."); const [busy, setBusy] = useState(false); async function browse() { setBusy(true); try { const text = await callTool(client, "termux_exec", { command: `cd ${path || "$HOME"} && pwd && ls -la`, timeout: 20 }); setOutput(text); } catch (error) { setOutput(error instanceof Error ? error.message : "Unable to browse files"); notify("File browse failed"); } finally { setBusy(false); } } return <div className="view"><SectionHead eyebrow="Filesystem surface / 003" title="Files on the peer." copy="Inspect the Termux filesystem through the authenticated reverse bridge." action={<button className="outline-button" onClick={() => void browse()}><RefreshCw size={14} /> Refresh</button>} /><div className="file-browser"><div className="path-bar"><FolderOpen size={16} /><input value={path} onChange={(event) => setPath(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void browse(); }} spellCheck={false} /><button onClick={() => void browse()} disabled={busy}>{busy ? <Loader2 size={15} className="spin" /> : "Open"}</button></div><pre className="code-output">{output}</pre></div><div className="notice"><ShieldCheck size={16} /><span>File operations are executed through <code>termux_exec</code>. The hub never stores the phone filesystem.</span></div></div>; }
 
@@ -308,6 +336,8 @@ function GatewayView({ client, notify }: { client: McpClient; notify: (text: str
   const [termuxReply, setTermuxReply] = useState("No Termux reply loaded.");
   const [termuxStatus, setTermuxStatus] = useState("Idle");
   const [watchingTermux, setWatchingTermux] = useState(false);
+  const [onlinePrompt, setOnlinePrompt] = useState("");
+  const [onlineStatus, setOnlineStatus] = useState("Idle");
   const [clientId] = useState(getBrowserClientId);
   const [conversationId, setConversationId] = useState<number | null>(null);
   const [pendingCommand, setPendingCommand] = useState<{ name: string; arguments: Record<string, unknown> } | null>(null);
@@ -440,16 +470,83 @@ function GatewayView({ client, notify }: { client: McpClient; notify: (text: str
     catch (error) { setTermuxStatus(error instanceof Error ? error.message : "Load failed"); }
     finally { setBusy(false); setWatchingTermux(false); }
   }
+  async function queueOnlineAgent() {
+    if (!onlinePrompt.trim()) return;
+    setBusy(true); setOnlineStatus("Queueing @onlineagent...");
+    try {
+      await callTool(client, "inbox_post", { to: "termux", body: formatOnlineAgentPrompt(onlinePrompt) });
+      setOnlinePrompt(""); setOnlineStatus("Queued for Lorna on Termux"); notify("@onlineagent prompt queued");
+    } catch (error) { setOnlineStatus(error instanceof Error ? error.message : "Online-agent queue failed"); notify("Online-agent queue failed"); }
+    finally { setBusy(false); }
+  }
 
-  return <div className="view"><SectionHead eyebrow="Cloud gateway / 007" title="Your CLI in the cloud." copy="Choose a model, ask the Manus assistant, and keep the conversation across browser refreshes. Read-only bridge inspection is automatic; Termux commands require explicit approval." action={<Badge tone={sent ? "live" : "neutral"}>{sent ? "ASSISTANT + MCP ONLINE" : "MANUS LLM"}</Badge>} /><div className="gateway-grid"><div className="terminal-panel gateway-terminal"><div className="terminal-top"><div className="terminal-dots"><i /><i /><i /></div><span>omega-cloud-cli / assistant + termux</span><Badge tone="live">DUAL PATH</Badge></div><div className="terminal-output gateway-output"><div className="output-line"><span className="prompt">omega@cloud:$</span> {command}</div><pre>{output}</pre>{busy && <div className="running-line"><Loader2 size={14} className="spin" /> processing request...</div>}</div><div className="terminal-input"><span>$</span><input value={command} onChange={(event) => setCommand(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !busy) void run(); }} spellCheck={false} /><button onClick={() => void run()} disabled={busy || !command.trim()}>{busy ? <Loader2 size={15} className="spin" /> : <Send size={15} />} Run on Termux</button></div></div><div className="panel gateway-composer"><div className="panel-title"><span>ASK THE MANUS ASSISTANT</span><Command size={15} /></div><p>This lane can inspect the bridge automatically. If the model proposes a Termux command, the exact command appears below for your approval before execution.</p><div className="chat-toolbar"><label>MODEL<select value={selectedModel} onChange={(event) => chooseModel(event.target.value)} disabled={modelsQuery.isLoading || createConversation.isPending}>{models.map((model) => <option key={model.id} value={model.id}>{model.label} · {model.family}</option>)}</select></label><div className="chat-toolbar-actions"><button className="outline-button" onClick={() => exportChat(currentMessages, "json")} disabled={!currentMessages.length}><FileCode2 size={14} /> JSON</button><button className="outline-button" onClick={() => exportChat(currentMessages, "text")} disabled={!currentMessages.length}><Clipboard size={14} /> Text</button><button className="outline-button" onClick={() => exportChat(currentMessages, "markdown")} disabled={!currentMessages.length}><FileCode2 size={14} /> Markdown</button><button className="outline-button" onClick={() => void copyConversation()} disabled={!currentMessages.length}><Clipboard size={14} /> Copy all</button><button className="outline-button" onClick={newChat} disabled={createConversation.isPending}><BookmarkPlus size={14} /> New chat</button></div></div><div className="conversation-list"><div className="conversation-list-title">SAVED CONVERSATIONS</div>{(conversationsQuery.data || []).map((conversation) => <button type="button" key={conversation.id} className={`conversation-item ${conversation.id === conversationId ? "active" : ""}`} onClick={() => { setConversationId(conversation.id); setSelectedModel(conversation.model); setPendingCommand(null); }}><span>{conversation.title}</span><small>Updated {new Date(conversation.updatedAt).toLocaleDateString()}</small></button>)}</div><div className="chat-memory"><span>{activeConversation?.title || "Starting browser memory..."}</span><small>{currentMessages.length} saved messages · refresh-safe</small></div><div className="chat-history">{currentMessages.slice(-6).map((message) => <div className={`history-line ${message.role}`} key={message.id}><b>{message.role === "user" ? "YOU" : "MANUS"}</b><ChatMessageContent content={message.content} /></div>)}</div><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); askManus(); } }} maxLength={120000} placeholder="Ask the Manus assistant anything..." /><button className="primary-small" onClick={askManus} disabled={busy || askConversation.isPending || !prompt.trim() || !conversationId}>{busy || askConversation.isPending ? <Loader2 size={14} className="spin" /> : <Command size={14} />} Ask Manus + MCP</button>{pendingCommand && <div className="command-approval"><div><strong>COMMAND APPROVAL REQUIRED</strong><p>The assistant wants to run this command on Termux:</p><code>{String(pendingCommand.arguments.command || "")}</code></div><div className="approval-actions"><button className="primary-small" onClick={approveCommand} disabled={executeCommand.isPending}>{executeCommand.isPending ? <Loader2 size={14} className="spin" /> : <ShieldCheck size={14} />} Approve and execute</button><button className="outline-button" onClick={() => setPendingCommand(null)} disabled={executeCommand.isPending}>Cancel</button></div></div>}<div className="gateway-contract"><span>ASSISTANT + MCP PATH</span><code>browser → server → selected model ⇄ MCP inspection / approved Termux command</code><span>TERMUX PATH</span><code>browser → Render hub → reverse bridge → Termux</code></div></div><div className="panel gateway-composer gateway-relay"><div className="panel-title"><span>TWO-WAY TERMUX RELAY</span><Send size={15} /></div><p>Send a message to the phone CLI, then load the response from the existing Omega inbox.</p><textarea value={termuxMessage} onChange={(event) => setTermuxMessage(event.target.value)} placeholder="Message the Termux CLI..." /><div className="gateway-relay-actions"><button className="primary-small" onClick={() => void sendToTermux()} disabled={busy || !termuxMessage.trim()}>{busy ? <Loader2 size={14} className="spin" /> : <Send size={14} />} Send to Termux</button><button className="outline-button" onClick={() => void loadTermuxReplies()} disabled={busy}><RefreshCw size={14} /> {watchingTermux ? "Loading..." : "Load replies"}</button></div><div className="gateway-status">{termuxStatus}</div><pre className="gateway-reply">{termuxReply}</pre></div></div><div className="notice"><ShieldCheck size={16} /><span>Chat history is stored server-side for this browser's local client ID. Forge credentials remain server-side. Commands require explicit approval; writes and destructive tools remain blocked.</span></div></div>;
+  async function probeLornaAgent() {
+    setBusy(true); setOnlineStatus("Running lorna2 --node agent...");
+    try {
+      const result = await callTool(client, "termux_exec", { command: formatLornaAgentProbe(), timeout: 60 });
+      setOutput(result); setOnlineStatus("Lorna agent probe completed"); notify("Lorna agent probe completed");
+    } catch (error) { setOnlineStatus(error instanceof Error ? error.message : "Lorna agent probe failed"); notify("Lorna agent probe failed"); }
+    finally { setBusy(false); }
+  }
+
+  return <div className="view"><SectionHead eyebrow="Cloud gateway / 007" title="Your CLI in the cloud." copy="Choose a model, ask the Manus assistant, and keep the conversation across browser refreshes. Read-only bridge inspection is automatic; Termux commands require explicit approval." action={<Badge tone={sent ? "live" : "neutral"}>{sent ? "ASSISTANT + MCP ONLINE" : "MANUS LLM"}</Badge>} /><div className="gateway-grid"><div className="terminal-panel gateway-terminal"><div className="terminal-top"><div className="terminal-dots"><i /><i /><i /></div><span>omega-cloud-cli / assistant + termux</span><Badge tone="live">DUAL PATH</Badge></div><div className="terminal-output gateway-output"><div className="output-line"><span className="prompt">omega@cloud:$</span> {command}</div><pre>{output}</pre>{busy && <div className="running-line"><Loader2 size={14} className="spin" /> processing request...</div>}</div><div className="terminal-input"><span>$</span><input value={command} onChange={(event) => setCommand(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !busy) void run(); }} spellCheck={false} /><button onClick={() => void run()} disabled={busy || !command.trim()}>{busy ? <Loader2 size={15} className="spin" /> : <Send size={15} />} Run on Termux</button></div></div><div className="panel gateway-composer"><div className="panel-title"><span>ASK THE MANUS ASSISTANT</span><Command size={15} /></div><p>This lane can inspect the bridge automatically. If the model proposes a Termux command, the exact command appears below for your approval before execution.</p><div className="chat-toolbar"><label>MODEL<select value={selectedModel} onChange={(event) => chooseModel(event.target.value)} disabled={modelsQuery.isLoading || createConversation.isPending}>{models.map((model) => <option key={model.id} value={model.id}>{model.label} · {model.family}</option>)}</select></label><div className="chat-toolbar-actions"><button className="outline-button" onClick={() => exportChat(currentMessages, "json")} disabled={!currentMessages.length}><FileCode2 size={14} /> JSON</button><button className="outline-button" onClick={() => exportChat(currentMessages, "text")} disabled={!currentMessages.length}><Clipboard size={14} /> Text</button><button className="outline-button" onClick={() => exportChat(currentMessages, "markdown")} disabled={!currentMessages.length}><FileCode2 size={14} /> Markdown</button><button className="outline-button" onClick={() => void copyConversation()} disabled={!currentMessages.length}><Clipboard size={14} /> Copy all</button><button className="outline-button" onClick={newChat} disabled={createConversation.isPending}><BookmarkPlus size={14} /> New chat</button></div></div><div className="conversation-list"><div className="conversation-list-title">SAVED CONVERSATIONS</div>{(conversationsQuery.data || []).map((conversation) => <button type="button" key={conversation.id} className={`conversation-item ${conversation.id === conversationId ? "active" : ""}`} onClick={() => { setConversationId(conversation.id); setSelectedModel(conversation.model); setPendingCommand(null); }}><span>{conversation.title}</span><small>Updated {new Date(conversation.updatedAt).toLocaleDateString()}</small></button>)}</div><div className="chat-memory"><span>{activeConversation?.title || "Starting browser memory..."}</span><small>{currentMessages.length} saved messages · refresh-safe</small></div><div className="chat-history">{currentMessages.slice(-6).map((message) => <div className={`history-line ${message.role}`} key={message.id}><b>{message.role === "user" ? "YOU" : "MANUS"}</b><ChatMessageContent content={message.content} /></div>)}</div><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); askManus(); } }} maxLength={120000} placeholder="Ask the Manus assistant anything..." /><button className="primary-small" onClick={askManus} disabled={busy || askConversation.isPending || !prompt.trim() || !conversationId}>{busy || askConversation.isPending ? <Loader2 size={14} className="spin" /> : <Command size={14} />} Ask Manus + MCP</button>{pendingCommand && <div className="command-approval"><div><strong>COMMAND APPROVAL REQUIRED</strong><p>The assistant wants to run this command on Termux:</p><code>{String(pendingCommand.arguments.command || "")}</code></div><div className="approval-actions"><button className="primary-small" onClick={approveCommand} disabled={executeCommand.isPending}>{executeCommand.isPending ? <Loader2 size={14} className="spin" /> : <ShieldCheck size={14} />} Approve and execute</button><button className="outline-button" onClick={() => setPendingCommand(null)} disabled={executeCommand.isPending}>Cancel</button></div></div>}<div className="gateway-contract"><span>ASSISTANT + MCP PATH</span><code>browser → server → selected model ⇄ MCP inspection / approved Termux command</code><span>TERMUX PATH</span><code>browser → Render hub → reverse bridge → Termux</code></div></div><div className="panel gateway-composer gateway-relay"><div className="panel-title"><span>TWO-WAY TERMUX RELAY</span><Send size={15} /></div><p>Send a message to the phone CLI, then load the response from the existing Omega inbox.</p><textarea value={termuxMessage} onChange={(event) => setTermuxMessage(event.target.value)} placeholder="Message the Termux CLI..." /><div className="gateway-relay-actions"><button className="primary-small" onClick={() => void sendToTermux()} disabled={busy || !termuxMessage.trim()}>{busy ? <Loader2 size={14} className="spin" /> : <Send size={14} />} Send to Termux</button><button className="outline-button" onClick={() => void loadTermuxReplies()} disabled={busy}><RefreshCw size={14} /> {watchingTermux ? "Loading..." : "Load replies"}</button></div><div className="gateway-status">{termuxStatus}</div><pre className="gateway-reply">{termuxReply}</pre></div><div className="panel gateway-composer online-agent-panel"><div className="panel-title"><span>LORNA ONLINE AGENT</span><Sparkles size={15} /></div><p>Queue an <code>@onlineagent</code> prompt for the Termux dispatcher. The Forge key stays on Termux; this website never stores it.</p><textarea value={onlinePrompt} onChange={(event) => setOnlinePrompt(event.target.value)} placeholder="Ask Claude Sonnet 4.6 through @onlineagent..." /><div className="gateway-relay-actions"><button className="primary-small" onClick={() => void queueOnlineAgent()} disabled={busy || !onlinePrompt.trim()}><Send size={14} /> Queue @onlineagent</button><button className="outline-button" onClick={() => void probeLornaAgent()} disabled={busy}><TerminalSquare size={14} /> Run /node agent probe</button></div><div className="gateway-status">{onlineStatus}</div></div></div><div className="notice"><ShieldCheck size={16} /><span>Chat history is stored server-side for this browser's local client ID. Forge credentials remain server-side. Commands require explicit approval; writes and destructive tools remain blocked.</span></div></div>;
 }
 
 function InboxView({ client, snap, notify }: { client: McpClient; snap: Snapshot | null; notify: (text: string) => void }) { const [messages, setMessages] = useState(snap?.inbox || []); const [body, setBody] = useState(""); const [busy, setBusy] = useState(false); async function reload() { try { const text = await callTool(client, "inbox_read", { for: "*" }); const parsed = jsonText(text); if (Array.isArray(parsed)) setMessages(parsed); } catch (error) { notify(error instanceof Error ? error.message : "Inbox read failed"); } } async function send() { if (!body.trim()) return; setBusy(true); try { await callTool(client, "inbox_post", { to: "termux", body: body.trim() }); setBody(""); await reload(); notify("Message queued for Termux"); } catch (error) { notify(error instanceof Error ? error.message : "Message failed"); } finally { setBusy(false); } } return <div className="view"><SectionHead eyebrow="Peer messaging / 006" title="Inbox relay." copy="Leave messages on the hub for the reverse-connected node, even when it is briefly offline." action={<button className="outline-button" onClick={() => void reload()}><RefreshCw size={14} /> Refresh</button>} /><div className="inbox-grid"><div className="panel composer"><div className="panel-title"><span>POST TO TERMUX</span><Send size={15} /></div><textarea value={body} onChange={(event) => setBody(event.target.value)} placeholder="Write a message for the connected phone..." /><button className="primary-small" onClick={() => void send()} disabled={busy || !body.trim()}>{busy ? <Loader2 size={14} className="spin" /> : <Send size={14} />} Queue message</button></div><div className="panel message-list"><div className="panel-title"><span>RECENT MESSAGES</span><span className="message-count">{messages.length}</span></div>{messages.length ? messages.map((message) => <div className="message" key={message.id}><div className="message-meta"><span>{message.to}</span><time>{new Date(message.at).toLocaleString()}</time></div><p>{message.body}</p></div>) : <div className="empty-runner"><Send size={20} /><p>No messages waiting on the hub.</p></div>}</div></div></div>; }
+
+function NodeMeshView({ client, snap, notify }: { client: McpClient; snap: Snapshot | null; notify: (text: string) => void }) {
+  type MeshMessage = { id?: string | number; to: string; from?: string; body: string; at?: string };
+  const nodes = [
+    { id: "vps", label: "NODE 1", name: "Omega VPS", role: "hub / server" },
+    { id: "termux", label: "NODE 2", name: "Termux device", role: "phone / reverse" },
+    { id: "cloud", label: "NODE 3", name: "Cloud CLI", role: "operator / browser" },
+  ];
+  const [messages, setMessages] = useState<MeshMessage[]>((snap?.inbox || []) as MeshMessage[]);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [targets, setTargets] = useState<Record<string, string>>({ vps: "termux", termux: "vps", cloud: "termux" });
+  const [busy, setBusy] = useState(false);
+
+  async function reload() {
+    try {
+      const parsed = jsonText(await callTool(client, "inbox_read", { for: "*" }));
+      if (Array.isArray(parsed)) setMessages(parsed as MeshMessage[]);
+    } catch (error) { notify(error instanceof Error ? error.message : "Mesh inbox read failed"); }
+  }
+  async function send(from: string) {
+    const body = drafts[from]?.trim(); const to = targets[from];
+    if (!body || !to) return;
+    setBusy(true);
+    try {
+      await callTool(client, "inbox_post", { to, body: `[${from}] ${body}` });
+      setDrafts((current) => ({ ...current, [from]: "" }));
+      await reload();
+      notify(`${from.toUpperCase()} → ${to.toUpperCase()} queued`);
+    } catch (error) { notify(error instanceof Error ? error.message : "Mesh message failed"); }
+    finally { setBusy(false); }
+  }
+  useEffect(() => { if (snap?.inbox) setMessages(snap.inbox as MeshMessage[]); }, [snap]);
+  useEffect(() => { const timer = window.setInterval(() => { void reload(); }, 7000); return () => window.clearInterval(timer); }, [client.url, client.key]);
+  const statusFor = (id: string) => snap?.peers?.find((peer) => peer.id === id)?.status || (id === "vps" ? "live" : "waiting");
+  const messagesFor = (id: string) => messages.filter((message) => message.to === id || message.from === id);
+  return <div className="view"><SectionHead eyebrow="Inter-node messaging / 009" title="Node mesh." copy="Three Cloud CLI lanes on one shared inbox. Send between nodes and watch the traffic return through the authenticated OMEGA hub." action={<button className="outline-button" onClick={() => void reload()} disabled={busy}>{busy ? <Loader2 size={14} className="spin" /> : <RefreshCw size={14} />} Refresh mesh</button>} /><div className="mesh-banner"><div><span className="strip-label">SHARED TRANSPORT</span><strong>OMEGA INBOX / STREAMABLE HTTP</strong><small>Messages are routed by node address; hub credentials stay in this browser session.</small></div><Badge tone={messages.length ? "live" : "neutral"}>{messages.length} MESSAGES</Badge></div><div className="node-mesh-grid">{nodes.map((node) => { const live = statusFor(node.id) === "live"; const nodeMessages = messagesFor(node.id).slice(-8); const recipients = nodes.filter((candidate) => candidate.id !== node.id); return <section className="panel node-card" key={node.id}><div className="node-card-head"><div><span className="node-label">{node.label}</span><h3>{node.name}</h3><small>{node.role}</small></div><Badge tone={live ? "live" : "warn"}>{live ? "LIVE" : "WAITING"}</Badge></div><div className="node-message-list">{nodeMessages.length ? nodeMessages.map((message, index) => <div className="node-message" key={`${message.id || message.at || "message"}-${index}`}><div><b>{message.from || "HUB"}</b><span>{message.to}</span></div><p>{message.body}</p><time>{message.at ? new Date(message.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "queued"}</time></div>) : <div className="node-empty"><Network size={17} /><span>No traffic for this node yet.</span></div>}</div><div className="node-composer"><select value={targets[node.id]} onChange={(event) => setTargets((current) => ({ ...current, [node.id]: event.target.value }))}>{recipients.map((recipient) => <option key={recipient.id} value={recipient.id}>Send to {recipient.label}</option>)}</select><textarea value={drafts[node.id] || ""} onChange={(event) => setDrafts((current) => ({ ...current, [node.id]: event.target.value }))} placeholder={`Message from ${node.label.toLowerCase()}...`} onKeyDown={(event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); void send(node.id); } }} /><button className="primary-small" onClick={() => void send(node.id)} disabled={busy || !drafts[node.id]?.trim()}><Send size={14} /> Send from {node.label}</button></div></section>; })}</div><div className="notice"><Network size={16} /><span><strong>Routing note:</strong> Node addresses default to <code>vps</code>, <code>termux</code>, and <code>cloud</code>. If the hub advertises different peer IDs, update the target addresses in the bridge contract before using those lanes.</span></div></div>;
+}
 
 export default function Home() {
   const [client, setClient] = useState<McpClient | null>(null);
   const [tools, setTools] = useState<Tool[]>([]);
   const [status, setStatus] = useState<Health>({ ok: false });
+  const [restoring, setRestoring] = useState(true);
   const boot = (nextClient: McpClient, nextTools: Tool[], nextHealth: Health) => { setClient(nextClient); setTools(nextTools); setStatus(nextHealth); };
-  return client ? <AppShell client={client} initialTools={tools} initialHealth={status} onLock={() => setClient(null)} /> : <Unlock onUnlock={boot} />;
+  useEffect(() => {
+    const stored = parseOperatorSession(window.sessionStorage.getItem("omega-operator-session"));
+    if (!stored) { setRestoring(false); return; }
+    const restoredClient: McpClient = { ...stored, session: null };
+    Promise.all([listTools(restoredClient), health(restoredClient.url)])
+      .then(([nextTools, nextHealth]) => boot(restoredClient, nextTools, nextHealth))
+      .catch(() => window.sessionStorage.removeItem("omega-operator-session"))
+      .finally(() => setRestoring(false));
+  }, []);
+  if (client) return <AppShell client={client} initialTools={tools} initialHealth={status} onLock={() => { window.sessionStorage.removeItem("omega-operator-session"); setClient(null); }} />;
+  if (restoring) return <div className="unlock-page"><div className="unlock-card"><div className="eyebrow"><span className="eyebrow-line" />SECURE BRIDGE ACCESS</div><h1>Restoring the<br /><em>mesh.</em></h1><p className="unlock-copy">Validating your saved operator session without exposing the hub key to the server.</p></div></div>;
+  return <Unlock onUnlock={boot} />;
 }

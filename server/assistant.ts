@@ -11,7 +11,9 @@ const SYSTEM_PROMPT =
     "You are the OMEGA cloud assistant. Be precise, practical, and honest about what you can or cannot execute. You may inspect mesh, Termux, and connected service state with the provided MCP tools. You may propose a Termux command, but the operator must explicitly approve it before execution. Never claim to have accessed an external system unless a tool result actually provided that information. Writes, deletes, deployments, inbox mutations, and network mutations are blocked from this assistant lane.";
 
 export const MODEL_OPTIONS = [
+  { id: "local-qwen2.5-7b", label: "Local Qwen2.5 7B", family: "Local / Ollama", description: "Private CPU model on the configured host" },
   { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", family: "Anthropic", description: "Balanced reasoning and coding" },
+  { id: "claude-opus-4-6", label: "Claude Opus 4.6", family: "Anthropic", description: "High-capability reasoning" },
   { id: "claude-opus-4-7", label: "Claude Opus 4.7", family: "Anthropic", description: "Highest-capability reasoning" },
   { id: "claude-haiku-4-5", label: "Claude Haiku 4.5", family: "Anthropic", description: "Fast everyday responses" },
   { id: "gpt-5.5", label: "GPT-5.5", family: "OpenAI", description: "Flagship reasoning and coding" },
@@ -27,9 +29,45 @@ type IncomingMessage = { role?: unknown; content?: unknown };
 type ForgeMessage = Record<string, unknown>;
 type ForgeResponse = InvokeResult & { choices: Array<{ message: { role: string; content?: unknown; tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }; finish_reason: string | null }> };
 
-type AssistantBody = { model?: unknown; messages?: unknown; prompt?: unknown; bridge?: McpBridgeConfig };
+type AssistantBody = { model?: unknown; messages?: unknown; prompt?: unknown; memoryContext?: unknown; bridge?: McpBridgeConfig };
+
+const LOCAL_MODEL_ID = "local-qwen2.5-7b" as const;
 
 export function isChatModel(value: unknown): value is ChatModel { return MODEL_OPTIONS.some((option) => option.id === value); }
+
+export type ProviderHealth = { ok: boolean; model: string; endpoint: string; latencyMs: number | null; error?: string };
+
+function localEndpoint(): string {
+  return (ENV.localLlmApiUrl || "http://127.0.0.1:11434").replace(/\/+$/, "");
+}
+
+function localHeaders(): Record<string, string> {
+  return ENV.localLlmApiKey ? { Authorization: `Bearer ${ENV.localLlmApiKey}` } : {};
+}
+
+export async function checkLocalProvider(): Promise<ProviderHealth> {
+  const started = Date.now();
+  const endpoint = localEndpoint();
+  try {
+    const response = await fetch(`${endpoint}/v1/models`, { headers: localHeaders(), signal: AbortSignal.timeout(10000) });
+    const payload = await response.json().catch(() => null) as { data?: Array<{ id?: string }> } | null;
+    if (!response.ok) throw new Error(`Provider returned ${response.status}`);
+    const available = payload?.data?.some((model) => model.id === "qwen2.5:7b");
+    if (!available) throw new Error("qwen2.5:7b is not available");
+    return { ok: true, model: "qwen2.5:7b", endpoint, latencyMs: Date.now() - started };
+  } catch (error) {
+    return { ok: false, model: "qwen2.5:7b", endpoint, latencyMs: Date.now() - started, error: error instanceof Error ? error.message : "Provider unavailable" };
+  }
+}
+
+export async function streamLocalOmegaAssistant(messages: Message[], memoryContext: string): Promise<Response> {
+  const systemContent = memoryContext ? `${SYSTEM_PROMPT}\n\nPersistent operator memory (use only when relevant; do not invent or overwrite it):\n${memoryContext.slice(0, 12000)}` : SYSTEM_PROMPT;
+  return fetch(`${localEndpoint()}/v1/chat/completions`, {
+    method: "POST",
+    headers: { ...localHeaders(), "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify({ model: "qwen2.5:7b", messages: [{ role: "system", content: systemContent }, ...messages], max_tokens: MAX_OUTPUT_TOKENS, stream: true }),
+  });
+}
 
 export function normalizeAssistantMessages(body: unknown): Message[] {
   const payload = body && typeof body === "object" ? body as AssistantBody : {};
@@ -52,7 +90,7 @@ export function extractAssistantText(result: ForgeResponse): string {
 }
 
 function modelToolRequest(model: ChatModel, messages: ForgeMessage[], tools?: ReturnType<typeof modelToolsForMcp>) {
-  const request: Record<string, unknown> = { model, messages };
+  const request: Record<string, unknown> = { model: model === LOCAL_MODEL_ID ? "qwen2.5:7b" : model, messages };
   if (tools?.length) {
     request.tools = tools;
     request.tool_choice = "auto";
@@ -63,12 +101,15 @@ function modelToolRequest(model: ChatModel, messages: ForgeMessage[], tools?: Re
 }
 
 async function forgeCompletion(model: ChatModel, messages: ForgeMessage[], tools?: ReturnType<typeof modelToolsForMcp>) {
-  const apiKey = ENV.forgeApiKey;
-  if (!apiKey) throw new Error("Forge backend is not configured on this deployment.");
-  const baseUrl = (ENV.forgeApiUrl || "https://forge.manus.ai").replace(/\/+$/, "");
+  const isLocal = model === LOCAL_MODEL_ID;
+  const apiKey = isLocal ? ENV.localLlmApiKey : ENV.forgeApiKey;
+  if (!isLocal && !apiKey) throw new Error("Forge backend is not configured on this deployment.");
+  const baseUrl = (isLocal ? ENV.localLlmApiUrl : ENV.forgeApiUrl || "https://forge.manus.ai").replace(/\/+$/, "");
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
   const response = await fetch(`${baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(modelToolRequest(model, messages, tools)),
   });
   const result = await response.json().catch(() => null) as ForgeResponse | { error?: { message?: string } } | null;
@@ -84,6 +125,7 @@ export async function completeOmegaAssistant(body: unknown) {
 
   let mcpTools: ReturnType<typeof modelToolsForMcp> = [];
   let mcpSession: string | null = null;
+  const usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0, requests: 0 };
   const bridge = payload.bridge && typeof payload.bridge === "object" ? payload.bridge : undefined;
   if (bridge?.url && bridge.key) {
     const discovered = await discoverAssistantTools(bridge);
@@ -91,17 +133,23 @@ export async function completeOmegaAssistant(body: unknown) {
     mcpSession = discovered.session;
   }
 
-  const transcript: ForgeMessage[] = [{ role: "system", content: SYSTEM_PROMPT }, ...messages.map(message => ({ role: message.role, content: message.content as string }))];
+  const memoryContext = typeof payload.memoryContext === "string" ? payload.memoryContext.trim().slice(0, 12000) : "";
+  const systemContent = memoryContext ? `${SYSTEM_PROMPT}\n\nPersistent operator memory (use only when relevant; do not invent or overwrite it):\n${memoryContext}` : SYSTEM_PROMPT;
+  const transcript: ForgeMessage[] = [{ role: "system", content: systemContent }, ...messages.map(message => ({ role: message.role, content: message.content as string }))];
   let toolCalls = 0;
   for (let round = 0; round <= MAX_MCP_ROUNDS; round += 1) {
     const result = await forgeCompletion(model, transcript, mcpTools);
+    usage.promptTokens += result.usage?.prompt_tokens || 0;
+    usage.completionTokens += result.usage?.completion_tokens || 0;
+    usage.totalTokens += result.usage?.total_tokens || 0;
+    usage.requests += 1;
     const assistantMessage = result.choices[0]?.message;
     if (!assistantMessage) throw new Error("Forge returned an empty response.");
     const calls = assistantMessage.tool_calls || [];
     if (!calls.length || !bridge) {
       const content = extractAssistantText(result);
       if (!content) throw new Error("Forge returned an empty response.");
-      return { model: result.model || model, content, toolsUsed: toolCalls };
+      return { model: result.model || model, content, toolsUsed: toolCalls, usage };
     }
     transcript.push({ role: "assistant", content: assistantMessage.content ?? null, tool_calls: calls });
     for (const call of calls.slice(0, 4)) {
@@ -110,8 +158,8 @@ export async function completeOmegaAssistant(body: unknown) {
       try { args = JSON.parse(call.function.arguments || "{}"); } catch { args = {}; }
       if (isCommandTool(call.function.name)) {
         const command = typeof args.command === "string" ? args.command.trim() : "";
-        if (!command) return { model: result.model || model, content: "The assistant proposed an empty Termux command, so nothing was executed.", toolsUsed: toolCalls, pendingTool: null };
-        return { model: result.model || model, content: `Command approval required before execution:\n\n\`${command}\``, toolsUsed: toolCalls, pendingTool: { name: call.function.name, arguments: args } };
+        if (!command) return { model: result.model || model, content: "The assistant proposed an empty Termux command, so nothing was executed.", toolsUsed: toolCalls, pendingTool: null, usage };
+        return { model: result.model || model, content: `Command approval required before execution:\n\n\`${command}\``, toolsUsed: toolCalls, pendingTool: { name: call.function.name, arguments: args }, usage };
       }
       const toolResult = await callAssistantTool(bridge, mcpSession, call.function.name, args);
       mcpSession = toolResult.session;
